@@ -2,6 +2,10 @@ import { Client, LocalAuth, GroupChat, Message, Contact, MessageMedia } from 'wh
 import * as qrcode from 'qrcode-terminal';
 import * as fs from 'fs';
 import * as path from 'path';
+import 'dotenv/config';
+
+// Environment configuration
+const FIRST_RUN = process.env.FIRST_RUN === 'true';
 
 // ============================================================================
 // Type Definitions
@@ -663,14 +667,40 @@ async function collectMessages(
 ): Promise<{ chatMessages: ChatMessage[]; rawMessages: Message[] }> {
     console.log(`  - Fetching messages...`);
 
-    // Sync history first to get older messages from server
-    await group.syncHistory();
+    // Load messages with retries to ensure we get historical messages
+    const TARGET_MESSAGES = 500;
+    const MAX_RETRIES = 10;
+    let retries = 0;
+    let allMessages = await group.fetchMessages({ limit: TARGET_MESSAGES });
+    console.log(`  - Initial fetch: ${allMessages.length} messages`);
 
-    // Fetch messages and filter to last 10 minutes only (rolling window)
-    const tenMinutesAgo = Math.floor(Date.now() / 1000) - (10 * 60);
-    const allMessages = await group.fetchMessages({ limit: Infinity });
-    const messages = allMessages.filter(msg => msg.timestamp >= tenMinutesAgo);
-    console.log(`  - Found ${allMessages.length} total, filtered to ${messages.length} from last 10 minutes`);
+    // Keep loading until we hit target or no more messages come in
+    while (allMessages.length < TARGET_MESSAGES && retries < MAX_RETRIES) {
+        const prevCount = allMessages.length;
+        await new Promise(resolve => setTimeout(resolve, 1000)); // Wait 1 second between loads
+        allMessages = await group.fetchMessages({ limit: TARGET_MESSAGES });
+        console.log(`  - Retry ${retries + 1}: ${allMessages.length} messages`);
+
+        // If no new messages loaded, stop retrying
+        if (allMessages.length === prevCount) {
+            console.log(`  - No new messages loaded, stopping`);
+            break;
+        }
+        retries++;
+    }
+
+    // Filter messages based on FIRST_RUN setting
+    let messages: Message[];
+    if (FIRST_RUN) {
+        // First run: get all messages without time filter
+        messages = allMessages;
+        console.log(`  - FIRST_RUN mode: returning all ${allMessages.length} messages`);
+    } else {
+        // Normal run: filter to last 10 minutes only (rolling window)
+        const tenMinutesAgo = Math.floor(Date.now() / 1000) - (10 * 60);
+        messages = allMessages.filter(msg => msg.timestamp >= tenMinutesAgo);
+        console.log(`  - Found ${allMessages.length} total, filtered to ${messages.length} from last 10 minutes`);
+    }
 
     const chatMessages: ChatMessage[] = [];
     let mediaCount = 0;
