@@ -105,7 +105,7 @@ interface LidMappingCache {
 // Configuration
 // ============================================================================
 
-const AVATAR_NAME = 'default_avatar'; // Change this per user/session
+const AVATAR_NAME = 'Dvir'; // Change this per user/session
 const MAX_GROUPS = 4; // Only process first 2 groups
 const DATA_DIR = path.join(process.cwd(), 'data');
 
@@ -259,7 +259,8 @@ async function resolveLid(
 }
 
 /**
- * Builds LID mapping cache by scanning all contacts.
+ * Builds LID mapping cache by scanning all contacts using getContactLidAndPhone.
+ * The cache maps LID -> phone number for resolving internal WhatsApp identifiers.
  */
 async function buildLidMappingFromContacts(
     client: Client,
@@ -271,27 +272,38 @@ async function buildLidMappingFromContacts(
 
     try {
         const contacts = await client.getContacts();
-        let newMappings = 0;
 
+        // Collect user IDs for batch lookup
+        const userIds: string[] = [];
         for (const contact of contacts) {
-            if (contact.number && contact.id._serialized) {
-                const idNumber = extractIdNumber(contact.id._serialized);
+            if (contact.id._serialized && contact.id._serialized.endsWith('@c.us')) {
+                userIds.push(contact.id._serialized);
+            }
+        }
 
-                // If we have a phone number, cache it
-                if (contact.number && !cache.mappings[idNumber]) {
-                    cache.mappings[idNumber] = {
-                        lid: idNumber,
-                        phoneNumber: contact.number,
+        console.log(`  - Found ${userIds.length} contacts to lookup`);
+
+        if (userIds.length > 0) {
+            // Use getContactLidAndPhone to get LID -> phone number mappings
+            const lidPhoneMappings = await (client as any).getContactLidAndPhone(userIds);
+            let newMappings = 0;
+
+            for (const mapping of lidPhoneMappings) {
+                // mapping has { lid: string, pn: string }
+                if (mapping.lid && mapping.pn && !cache.mappings[mapping.lid]) {
+                    cache.mappings[mapping.lid] = {
+                        lid: mapping.lid,
+                        phoneNumber: mapping.pn,
                         resolvedAt: getISOTimestamp(),
                         source: 'contact_lookup'
                     };
                     newMappings++;
                 }
             }
-        }
 
-        saveLidMappingCache(avatarPath, cache);
-        console.log(`  - LID cache: ${Object.keys(cache.mappings).length} total mappings (${newMappings} new)`);
+            saveLidMappingCache(avatarPath, cache);
+            console.log(`  - LID cache: ${Object.keys(cache.mappings).length} total mappings (${newMappings} new)`);
+        }
 
     } catch (error) {
         console.log(`  - Error building LID cache: ${error}`);
@@ -308,7 +320,7 @@ async function buildLidMappingFromContacts(
  * Extracts membership events (join/leave/removed) from WhatsApp system messages.
  * WhatsApp sends notification messages for group membership changes.
  */
-function extractMembershipEvents(messages: Message[]): MembershipEvent[] {
+function extractMembershipEvents(messages: Message[], lidCache: LidMappingCache): MembershipEvent[] {
     const events: MembershipEvent[] = [];
 
     for (const msg of messages) {
@@ -343,14 +355,32 @@ function extractMembershipEvents(messages: Message[]): MembershipEvent[] {
         const affectedUsers: string[] = [];
         if (rawData.recipients && Array.isArray(rawData.recipients)) {
             for (const recipient of rawData.recipients) {
-                affectedUsers.push(extractIdNumber(recipient));
+                // Handle both string IDs and object IDs
+                const recipientId = typeof recipient === 'string'
+                    ? recipient
+                    : recipient?._serialized || recipient?.id?._serialized;
+                if (recipientId) {
+                    const idNumber = extractIdNumber(recipientId);
+                    // Resolve LID to phone number if possible
+                    if (isLid(idNumber) && lidCache.mappings[idNumber]) {
+                        affectedUsers.push(lidCache.mappings[idNumber].phoneNumber);
+                    } else {
+                        affectedUsers.push(idNumber);
+                    }
+                }
             }
         }
 
         // Get who performed the action (author)
         let performedBy: string | null = null;
         if (msg.author) {
-            performedBy = extractIdNumber(msg.author);
+            const authorId = extractIdNumber(msg.author);
+            // Resolve LID to phone number if possible
+            if (isLid(authorId) && lidCache.mappings[authorId]) {
+                performedBy = lidCache.mappings[authorId].phoneNumber;
+            } else {
+                performedBy = authorId;
+            }
         }
 
         events.push({
@@ -465,7 +495,7 @@ async function processGroups(): Promise<void> {
             ]);
 
             // Extract membership events (join/leave/removed) from system messages
-            const membershipEvents = extractMembershipEvents(messages.rawMessages);
+            const membershipEvents = extractMembershipEvents(messages.rawMessages, lidCache);
 
             // Save all JSON files
             fs.writeFileSync(
