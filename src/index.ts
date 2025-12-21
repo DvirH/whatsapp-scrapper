@@ -27,6 +27,13 @@ interface ChatMessage {
     sender: Sender;
     has_media: boolean;
     media_path: string | null;
+    isFailedToDownload: boolean;
+    isGif: boolean;
+    isForwarded: boolean;
+    links: Array<{ link: string; isSuspicious: boolean }>;
+    location: { latitude: number; longitude: number; description?: string } | null;
+    mentionedIds: string[];
+    vCardContacts: ContactInfo[];
     reactions: Array<{ emoji: string; sender: Sender }>;
     isReply: boolean;
     replyInfo: ReplyInfo | null;
@@ -34,6 +41,7 @@ interface ChatMessage {
     isViewOnce: boolean;
     originalAuthorId: string;
     resolvedAuthorId: string | null;
+    metadata: WhatsAppMetadata;
 }
 
 interface GroupInfo {
@@ -77,6 +85,46 @@ interface ReplyInfo {
     quotedMessageId: string;
     quotedText: string | null;
     quotedSenderId: string | null;
+}
+
+interface WhatsAppMetadata {
+    type: string;
+    duration: number | null;
+    groupMentions: Array<{
+        groupSubject: string;
+        groupJid: { server: string; user: string; _serialized: string };
+    }>;
+}
+
+interface ContactInfo {
+    name: string;
+    number: string;
+    vcard: string;
+}
+
+interface PollVote {
+    pollId: string;
+    pollTimestamp: number;
+    voterId: string;
+    voterPhone: string | null;
+    voterName: string | null;
+    selectedOptions: string[];
+    timestamp: number;
+}
+
+interface ErrorLogEntry {
+    timestamp: string;
+    messageId: string;
+    errorType: 'media_download' | 'poll_votes' | 'vcard_extraction' | 'reaction' | 'other';
+    error: string;
+    explanation: string;
+    context: {
+        messageType?: string;
+        messageTimestamp?: number;
+        isOldMessage?: boolean;
+        isGif?: boolean;
+        isViewOnce?: boolean;
+    };
 }
 
 interface MembershipEvent {
@@ -396,6 +444,92 @@ function extractMembershipEvents(messages: Message[], lidCache: LidMappingCache)
     return events;
 }
 
+/**
+ * Collects poll votes from poll messages.
+ */
+async function collectPollVotes(
+    messages: Message[],
+    lidCache: LidMappingCache
+): Promise<{ votes: PollVote[]; errors: ErrorLogEntry[] }> {
+    const pollVotes: PollVote[] = [];
+    const errors: ErrorLogEntry[] = [];
+
+    for (const msg of messages) {
+        if (msg.type !== 'poll_creation') continue;
+
+        try {
+            const votes = await (msg as any).getPollVotes();
+            if (votes && Array.isArray(votes)) {
+                for (const vote of votes) {
+                    let voterPhone: string | null = null;
+                    let voterName: string | null = null;
+                    let voterId: string = 'unknown';
+
+                    // Handle different voter formats (could be string, object, or undefined)
+                    // Note: wwebjs docs say voter is a string, but keep fallbacks for safety
+                    const voterRaw = vote.voter;
+                    if (voterRaw) {
+                        if (typeof voterRaw === 'string') {
+                            voterId = extractIdNumber(voterRaw);
+                        } else if ((voterRaw as any)._serialized) {
+                            voterId = extractIdNumber((voterRaw as any)._serialized);
+                        } else if ((voterRaw as any).id?._serialized) {
+                            voterId = extractIdNumber((voterRaw as any).id._serialized);
+                        }
+
+                        // Try to get voter contact info
+                        try {
+                            const senderId = typeof voterRaw === 'string'
+                                ? voterRaw
+                                : ((voterRaw as any)._serialized || (voterRaw as any).id?._serialized);
+                            if (senderId) {
+                                const contact = await client.getContactById(senderId);
+                                voterPhone = contact.number || null;
+                                voterName = contact.pushname || contact.name || null;
+                            }
+                        } catch (e) {
+                            // Contact lookup failed
+                        }
+
+                        // Resolve LID if needed (ensure key ends with @lid)
+                        if (isLid(voterId)) {
+                            const lidKey = voterId.endsWith('@lid') ? voterId : `${voterId}@lid`;
+                            if (lidCache.mappings[lidKey]) {
+                                voterPhone = lidCache.mappings[lidKey].phoneNumber;
+                            }
+                        }
+                    }
+
+                    pollVotes.push({
+                        pollId: msg.id.id,
+                        pollTimestamp: msg.timestamp,
+                        voterId: voterId,
+                        voterPhone: voterPhone,
+                        voterName: voterName,
+                        selectedOptions: vote.selectedOptions || [],
+                        timestamp: vote.timestamp || 0
+                    });
+                }
+            }
+        } catch (error) {
+            console.log(`    - Could not get poll votes for ${msg.id.id}: ${error}`);
+            errors.push({
+                timestamp: getISOTimestamp(),
+                messageId: msg.id.id,
+                errorType: 'poll_votes',
+                error: String(error),
+                explanation: 'Failed to retrieve poll votes - poll may have no votes or API limitation',
+                context: {
+                    messageType: msg.type,
+                    messageTimestamp: msg.timestamp
+                }
+            });
+        }
+    }
+
+    return { votes: pollVotes, errors };
+}
+
 // ============================================================================
 // WhatsApp Client Setup
 // ============================================================================
@@ -523,6 +657,63 @@ async function processGroups(): Promise<void> {
                     JSON.stringify(membershipEvents, null, 4)
                 );
                 console.log(`  - Saved membership_events.json (${membershipEvents.length} events)`);
+            }
+
+            // Collect and save poll votes
+            const pollResult = await collectPollVotes(messages.rawMessages, lidCache);
+            if (pollResult.votes.length > 0) {
+                fs.writeFileSync(
+                    path.join(groupPath, 'group_votes.json'),
+                    JSON.stringify(pollResult.votes, null, 4)
+                );
+                console.log(`  - Saved group_votes.json (${pollResult.votes.length} votes)`);
+            }
+
+            // Save raw messages
+            const rawMessagesData = await Promise.all(messages.rawMessages.map(async (msg) => {
+                const raw = (msg as any).rawData || (msg as any)._data || {};
+                const baseData = {
+                    id: msg.id,
+                    timestamp: msg.timestamp,
+                    type: msg.type,
+                    body: msg.body,
+                    from: msg.from,
+                    to: msg.to,
+                    author: msg.author,
+                    hasMedia: msg.hasMedia,
+                    hasQuotedMsg: msg.hasQuotedMsg,
+                    ...raw
+                };
+
+                // Add raw poll votes for poll_creation messages
+                if (msg.type === 'poll_creation') {
+                    try {
+                        const rawPollVotes = await (msg as any).getPollVotes();
+                        return { ...baseData, rawPollVotes };
+                    } catch (e) {
+                        return baseData;
+                    }
+                }
+
+                return baseData;
+            }));
+            fs.writeFileSync(
+                path.join(groupPath, 'raw_messages.json'),
+                JSON.stringify(rawMessagesData, null, 4)
+            );
+            console.log(`  - Saved raw_messages.json (${rawMessagesData.length} messages)`);
+
+            // Combine and save all errors
+            const allErrors: ErrorLogEntry[] = [
+                ...messages.errors,
+                ...pollResult.errors
+            ];
+            if (allErrors.length > 0) {
+                fs.writeFileSync(
+                    path.join(groupPath, 'error_log.json'),
+                    JSON.stringify(allErrors, null, 4)
+                );
+                console.log(`  - Saved error_log.json (${allErrors.length} errors)`);
             }
 
         } catch (error) {
@@ -659,14 +850,14 @@ async function collectGroupMembers(group: GroupChat, usersMediaPath: string): Pr
 
         // Try to download profile picture
         try {
-            // const profilePicUrl = await client.getProfilePicUrl(participant.id._serialized);
-            // if (profilePicUrl) {
-            //     const media = await MessageMedia.fromUrl(profilePicUrl);
-            //     const ext = getMediaExtension(media.mimetype);
-            //     const fileName = `${extractIdNumber(participant.id._serialized)}.${ext}`;
-            //     profilePicPath = path.join(usersMediaPath, fileName);
-            //     await saveMedia(media, profilePicPath);
-            // }
+            const profilePicUrl = await client.getProfilePicUrl(participant.id._serialized);
+            if (profilePicUrl) {
+                const media = await MessageMedia.fromUrl(profilePicUrl);
+                const ext = getMediaExtension(media.mimetype);
+                const fileName = `${extractIdNumber(participant.id._serialized)}.${ext}`;
+                profilePicPath = path.join(usersMediaPath, fileName);
+                await saveMedia(media, profilePicPath);
+            }
         } catch (error) {
             // Profile picture not available
         }
@@ -694,8 +885,9 @@ async function collectMessages(
     group: GroupChat,
     mediaPath: string,
     lidCache: LidMappingCache
-): Promise<{ chatMessages: ChatMessage[]; rawMessages: Message[] }> {
+): Promise<{ chatMessages: ChatMessage[]; rawMessages: Message[]; errors: ErrorLogEntry[] }> {
     console.log(`  - Fetching messages...`);
+    const errors: ErrorLogEntry[] = [];
 
     // Load messages with retries to ensure we get historical messages
     const TARGET_MESSAGES = 500;
@@ -780,9 +972,16 @@ async function collectMessages(
             }
         }
 
+        // Extract raw data early for error context
+        const rawData = (msg as any).rawData || (msg as any)._data || {};
+        const isViewOnce = rawData?.isViewOnce || msg.type === 'ciphertext';
+        const isGif = msg.type === 'video' && (rawData.isGif || rawData.gifPlayback || false);
+
         // Handle media
         let mediaFilePath: string | null = null;
+        let isFailedToDownload = false;
         if (msg.hasMedia) {
+            let downloadError: string | null = null;
             try {
                 const media = await msg.downloadMedia();
                 if (media) {
@@ -792,9 +991,37 @@ async function collectMessages(
                     mediaFilePath = path.join(mediaPath, fileName);
                     await saveMedia(media, mediaFilePath);
                     mediaCount++;
+                } else {
+                    downloadError = 'Media download returned null';
                 }
             } catch (error) {
-                console.log(`    - Could not download media for message ${msg.id.id}`);
+                downloadError = String(error);
+            }
+
+            if (downloadError) {
+                isFailedToDownload = true;
+                const isOld = (Date.now() / 1000 - msg.timestamp) > 14 * 24 * 60 * 60; // >14 days
+                console.log(`    - Media download failed for ${msg.id.id}: ${downloadError}`);
+                errors.push({
+                    timestamp: getISOTimestamp(),
+                    messageId: msg.id.id,
+                    errorType: 'media_download',
+                    error: downloadError,
+                    explanation: isViewOnce
+                        ? 'View once media - only accessible once, may already be viewed'
+                        : isOld
+                            ? 'Message is older than 14 days - media likely expired on WhatsApp servers'
+                            : isGif
+                                ? 'GIF from external source (Giphy/Tenor) - may not be downloadable'
+                                : 'Media temporarily unavailable - network or timing issue',
+                    context: {
+                        messageType: msg.type,
+                        messageTimestamp: msg.timestamp,
+                        isOldMessage: isOld,
+                        isGif: isGif,
+                        isViewOnce: isViewOnce
+                    }
+                });
             }
         }
 
@@ -862,10 +1089,83 @@ async function collectMessages(
             }
         }
 
-        // Handle ephemeral and view-once flags
-        const isEphemeral = (msg as any).isEphemeral || false;
-        const rawData = (msg as any).rawData || (msg as any)._data;
-        const isViewOnce = rawData?.isViewOnce || false;
+        // Handle ephemeral flag (rawData, isViewOnce, isGif already extracted above)
+        const isEphemeral = (msg as any).isEphemeral || msg.type === 'ciphertext';
+
+        // Get forwarded status
+        const isForwarded = (msg as any).isForwarded || false;
+
+        // Get links from message
+        const links: Array<{ link: string; isSuspicious: boolean }> = [];
+        if ((msg as any).links && Array.isArray((msg as any).links)) {
+            for (const linkInfo of (msg as any).links) {
+                links.push({
+                    link: linkInfo.link || linkInfo.url || '',
+                    isSuspicious: linkInfo.isSuspicious || false
+                });
+            }
+        }
+
+        // Get location if present
+        let location: { latitude: number; longitude: number; description?: string } | null = null;
+        if ((msg as any).location) {
+            const loc = (msg as any).location;
+            location = {
+                latitude: loc.latitude,
+                longitude: loc.longitude,
+                description: loc.description || loc.address || undefined
+            };
+        }
+
+        // Get mentioned user IDs
+        const mentionedIds: string[] = [];
+        if ((msg as any).mentionedIds && Array.isArray((msg as any).mentionedIds)) {
+            for (const id of (msg as any).mentionedIds) {
+                mentionedIds.push(typeof id === 'string' ? extractIdNumber(id) : extractIdNumber(id._serialized || ''));
+            }
+        }
+
+        // Get vCard contacts if present (types are vcard or multi_vcard)
+        const vCardContacts: ContactInfo[] = [];
+        if (msg.type === 'vcard' || msg.type === 'multi_vcard') {
+            try {
+                // Use the vcard/vCards property directly instead of getVCards()
+                const vcardData = (msg as any).vCards || (msg as any).vcard;
+                if (vcardData) {
+                    // vcardData can be a string (single) or array (multi)
+                    const vcards = Array.isArray(vcardData) ? vcardData : [vcardData];
+                    for (const vcard of vcards) {
+                        // Parse vCard string to extract name and number
+                        const nameMatch = vcard.match(/FN:(.+)/);
+                        const telMatch = vcard.match(/TEL[^:]*:(.+)/);
+                        vCardContacts.push({
+                            name: nameMatch ? nameMatch[1].trim() : '',
+                            number: telMatch ? telMatch[1].replace(/\D/g, '') : '',
+                            vcard: vcard
+                        });
+                    }
+                }
+            } catch (error) {
+                errors.push({
+                    timestamp: getISOTimestamp(),
+                    messageId: msg.id.id,
+                    errorType: 'vcard_extraction',
+                    error: String(error),
+                    explanation: 'Failed to extract contact information from vCard',
+                    context: {
+                        messageType: msg.type,
+                        messageTimestamp: msg.timestamp
+                    }
+                });
+            }
+        }
+
+        // Build WhatsApp metadata
+        const metadata: WhatsAppMetadata = {
+            type: msg.type || 'unknown',
+            duration: rawData.duration || null,
+            groupMentions: rawData.groupMentions || []
+        };
 
         const chatMessage: ChatMessage = {
             id: `${extractIdNumber(group.id._serialized)}_${msg.id.id}`,
@@ -875,13 +1175,21 @@ async function collectMessages(
             sender: senderInfo,
             has_media: msg.hasMedia,
             media_path: mediaFilePath,
+            isFailedToDownload: isFailedToDownload,
+            isGif: isGif,
+            isForwarded: isForwarded,
+            links: links,
+            location: location,
+            mentionedIds: mentionedIds,
+            vCardContacts: vCardContacts,
             reactions: reactions,
             isReply: isReply,
             replyInfo: replyInfo,
             isEphemeral: isEphemeral,
             isViewOnce: isViewOnce,
             originalAuthorId: originalAuthorId,
-            resolvedAuthorId: resolvedAuthorId
+            resolvedAuthorId: resolvedAuthorId,
+            metadata: metadata
         };
 
         chatMessages.push(chatMessage);
@@ -891,7 +1199,7 @@ async function collectMessages(
         console.log(`  - Downloaded ${mediaCount} media files`);
     }
 
-    return { chatMessages, rawMessages: messages };
+    return { chatMessages, rawMessages: messages, errors };
 }
 
 // ============================================================================
