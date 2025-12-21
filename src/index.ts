@@ -42,6 +42,7 @@ interface ChatMessage {
     originalAuthorId: string;
     resolvedAuthorId: string | null;
     metadata: WhatsAppMetadata;
+    isEdited: boolean;
 }
 
 interface GroupInfo {
@@ -154,7 +155,7 @@ interface LidMappingCache {
 // ============================================================================
 
 const AVATAR_NAME = 'Dvir'; // Change this per user/session
-const MAX_GROUPS = 4; // Only process first 2 groups
+const MAX_GROUPS = Infinity; // Only process first 2 groups
 const DATA_DIR = path.join(process.cwd(), 'data');
 
 // ============================================================================
@@ -610,7 +611,7 @@ async function processGroups(): Promise<void> {
         const group = groupsToProcess[i];
         console.log(`\n[${i + 1}/${groupsToProcess.length}] Processing group: ${group.name}`);
 
-        if (group.name !== "דביר + הראל 1") { continue }
+        if (group.name !== "רותם - יניב - הראל - דביר") { continue }
         const groupDirName = sanitizeFileName(group.name);
         const groupPath = path.join(basePath, groupDirName);
         const mediaPath = path.join(groupPath, 'media');
@@ -976,6 +977,7 @@ async function collectMessages(
         const rawData = (msg as any).rawData || (msg as any)._data || {};
         const isViewOnce = rawData?.isViewOnce || msg.type === 'ciphertext';
         const isGif = msg.type === 'video' && (rawData.isGif || rawData.gifPlayback || false);
+        const isEdited = rawData.latestEditMsgKey != null || (msg as any).latestEditMsgKey != null;
 
         // Handle media
         let mediaFilePath: string | null = null;
@@ -1189,7 +1191,8 @@ async function collectMessages(
             isViewOnce: isViewOnce,
             originalAuthorId: originalAuthorId,
             resolvedAuthorId: resolvedAuthorId,
-            metadata: metadata
+            metadata: metadata,
+            isEdited: isEdited
         };
 
         chatMessages.push(chatMessage);
