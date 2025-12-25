@@ -3,9 +3,11 @@ import * as qrcode from 'qrcode-terminal';
 import * as fs from 'fs';
 import * as path from 'path';
 import 'dotenv/config';
+import logger from './logger';
 
 // Environment configuration
 const FIRST_RUN = process.env.FIRST_RUN === 'true';
+const MEDIA_DOWNLOAD_TIMEOUT = parseInt(process.env.MEDIA_DOWNLOAD_TIMEOUT || '10000', 10);
 
 // ============================================================================
 // Type Definitions
@@ -154,7 +156,7 @@ interface LidMappingCache {
 // Configuration
 // ============================================================================
 
-const AVATAR_NAME = 'Dvir'; // Change this per user/session
+const AVATAR_NAME = 'S62'; // Change this per user/session
 const MAX_GROUPS = Infinity; // Only process first 2 groups
 const DATA_DIR = path.join(process.cwd(), 'data');
 
@@ -163,7 +165,12 @@ const DATA_DIR = path.join(process.cwd(), 'data');
 // ============================================================================
 
 function sanitizeFileName(name: string): string {
-    return name.replace(/[<>:"/\\|?*]/g, '_').replace(/\s+/g, '_').substring(0, 100);
+    return name
+        .replace(/[<>:"/\\|?*\x00-\x1f\u200B-\u200D\uFEFF]/g, '') // Remove invalid chars and zero-width chars
+        .replace(/[^\w\u0590-\u05FF\u0600-\u06FF\u4E00-\u9FFF.-]/g, '-') // Replace other special chars with dash (keep Hebrew, Arabic, Chinese, alphanumeric)
+        .replace(/-+/g, '-') // Collapse multiple dashes
+        .replace(/^-|-$/g, '') // Trim leading/trailing dashes
+        .substring(0, 100) || 'unnamed';
 }
 
 function getCurrentTimestamp(): string {
@@ -173,6 +180,14 @@ function getCurrentTimestamp(): string {
 
 function getISOTimestamp(): string {
     return new Date().toISOString();
+}
+
+function formatDuration(ms: number): string {
+    if (ms < 1000) return `${ms}ms`;
+    if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`;
+    const minutes = Math.floor(ms / 60000);
+    const seconds = Math.floor((ms % 60000) / 1000);
+    return `${minutes}m ${seconds}s`;
 }
 
 function ensureDir(dirPath: string): void {
@@ -207,6 +222,13 @@ function getMediaExtension(mimetype: string): string {
         'application/msword': 'doc',
     };
     return mimeToExt[mimetype] || mimetype.split('/')[1] || 'bin';
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number, errorMessage: string): Promise<T> {
+    const timeout = new Promise<never>((_, reject) => {
+        setTimeout(() => reject(new Error(errorMessage)), ms);
+    });
+    return Promise.race([promise, timeout]);
 }
 
 // ============================================================================
@@ -251,7 +273,7 @@ function loadLidMappingCache(avatarPath: string): LidMappingCache {
             const data = fs.readFileSync(cachePath, 'utf-8');
             return JSON.parse(data);
         } catch (error) {
-            console.log('  - Could not load LID cache, creating new one');
+            logger.warn('  - Could not load LID cache, creating new one');
         }
     }
 
@@ -317,7 +339,7 @@ async function buildLidMappingFromContacts(
 ): Promise<LidMappingCache> {
     const cache = loadLidMappingCache(avatarPath);
 
-    console.log('Building LID mapping cache from contacts...');
+    logger.info('Building LID mapping cache from contacts...');
 
     try {
         const contacts = await client.getContacts();
@@ -330,7 +352,7 @@ async function buildLidMappingFromContacts(
             }
         }
 
-        console.log(`  - Found ${userIds.length} contacts to lookup`);
+        logger.info(`  - Found ${userIds.length} contacts to lookup`);
 
         if (userIds.length > 0) {
             // Use getContactLidAndPhone to get LID -> phone number mappings
@@ -351,11 +373,11 @@ async function buildLidMappingFromContacts(
             }
 
             saveLidMappingCache(avatarPath, cache);
-            console.log(`  - LID cache: ${Object.keys(cache.mappings).length} total mappings (${newMappings} new)`);
+            logger.info(`  - LID cache: ${Object.keys(cache.mappings).length} total mappings (${newMappings} new)`);
         }
 
     } catch (error) {
-        console.log(`  - Error building LID cache: ${error}`);
+        logger.error(`  - Error building LID cache: ${error}`);
     }
 
     return cache;
@@ -513,7 +535,7 @@ async function collectPollVotes(
                 }
             }
         } catch (error) {
-            console.log(`    - Could not get poll votes for ${msg.id.id}: ${error}`);
+            logger.warn(`    - Could not get poll votes for ${msg.id.id}: ${error}`);
             errors.push({
                 timestamp: getISOTimestamp(),
                 messageId: msg.id.id,
@@ -547,40 +569,97 @@ const client = new Client({
 });
 
 // ============================================================================
+// Graceful Shutdown
+// ============================================================================
+
+let isShuttingDown = false;
+let isClientReady = false;
+
+function serializeError(error: unknown): { message: string; stack?: string } {
+    if (error instanceof Error) {
+        return { message: error.message, stack: error.stack };
+    }
+    return { message: String(error) };
+}
+
+async function gracefulShutdown(exitCode: number = 0, reason: string = 'unknown'): Promise<void> {
+    if (isShuttingDown) return;
+    isShuttingDown = true;
+
+    logger.info(`Shutting down: ${reason}`);
+
+    if (isClientReady) {
+        try {
+            await client.destroy();
+            logger.info('Client destroyed successfully');
+        } catch (error) {
+            logger.error({ err: serializeError(error) }, 'Error destroying client');
+        }
+    }
+
+    process.exit(exitCode);
+}
+
+// Handle Ctrl+C
+process.on('SIGINT', () => {
+    gracefulShutdown(0, 'SIGINT');
+});
+
+// Handle kill signal
+process.on('SIGTERM', () => {
+    gracefulShutdown(0, 'SIGTERM');
+});
+
+// Handle uncaught exceptions
+process.on('uncaughtException', (error) => {
+    logger.fatal({ err: serializeError(error) }, 'Uncaught exception');
+    gracefulShutdown(1, 'uncaughtException');
+});
+
+// Handle unhandled promise rejections
+process.on('unhandledRejection', (reason) => {
+    logger.fatal({ err: serializeError(reason) }, 'Unhandled rejection');
+    gracefulShutdown(1, 'unhandledRejection');
+});
+
+// ============================================================================
 // Event Handlers
 // ============================================================================
 
 client.on('qr', (qr: string) => {
-    console.log('\n========================================');
-    console.log('Scan this QR code with WhatsApp:');
-    console.log('========================================\n');
+    logger.info('\n========================================');
+    logger.info('Scan this QR code with WhatsApp:');
+    logger.info('========================================\n');
     qrcode.generate(qr, { small: true });
 });
 
 client.on('authenticated', () => {
-    console.log('Authenticated successfully!');
+    logger.info('Authenticated successfully!');
 });
 
 client.on('auth_failure', (msg: string) => {
-    console.error('Authentication failed:', msg);
-    process.exit(1);
+    logger.fatal({ error: msg }, 'Authentication failed');
+    gracefulShutdown(1, 'auth_failure');
 });
 
 client.on('disconnected', (reason: string) => {
-    console.log('Client disconnected:', reason);
+    logger.warn(`Client disconnected: ${reason}`);
+    gracefulShutdown(1, `disconnected: ${reason}`);
 });
 
 client.on('ready', async () => {
-    console.log('\n========================================');
-    console.log('WhatsApp Client is ready!');
-    console.log('========================================\n');
+    isClientReady = true;
+    logger.info('\n========================================');
+    logger.info('WhatsApp Client is ready!');
+    logger.info('========================================\n');
 
     try {
         await processGroups();
-        console.log('\nData collection complete!');
-        console.log('You can now close this program or leave it running for live updates.');
+        logger.info('\nData collection complete!');
+        await gracefulShutdown(0, 'complete');
     } catch (error) {
-        console.error('Error processing groups:', error);
+        logger.error({ err: serializeError(error) }, 'Error processing groups');
+        await gracefulShutdown(1, 'processing_error');
     }
 });
 
@@ -596,38 +675,56 @@ async function processGroups(): Promise<void> {
     // Build LID mapping cache from contacts
     const lidCache = await buildLidMappingFromContacts(client, avatarPath);
 
-    console.log(`Fetching chats...`);
+    logger.info('Fetching chats...');
+    const chatsStartTime = Date.now();
     const chats = await client.getChats();
+    logger.info(`Fetching chats... done. Took ${formatDuration(Date.now() - chatsStartTime)}`);
 
     // Filter to group chats only
     const groupChats = chats.filter(chat => chat.isGroup) as GroupChat[];
-    console.log(`Found ${groupChats.length} group chats`);
+    logger.info(`Found ${groupChats.length} group chats`);
 
     // Process only first MAX_GROUPS groups
     const groupsToProcess = groupChats.slice(0, MAX_GROUPS);
-    console.log(`Processing ${groupsToProcess.length} groups...\n`);
+    logger.info(`Processing ${groupsToProcess.length} groups...\n`);
 
     for (let i = 0; i < groupsToProcess.length; i++) {
         const group = groupsToProcess[i];
-        console.log(`\n[${i + 1}/${groupsToProcess.length}] Processing group: ${group.name}`);
+        logger.info(`\n[${i + 1}/${groupsToProcess.length}] Processing group: ${group.name}`);
 
-        if (group.name !== "רותם - יניב - הראל - דביר") { continue }
-        const groupDirName = sanitizeFileName(group.name);
+        // if (group.name !== "רותם - יניב - הראל - דביר") { continue }
+        const groupId = extractIdNumber(group.id._serialized);
+        const groupDirName = `${sanitizeFileName(group.name)}_${groupId}`;
         const groupPath = path.join(basePath, groupDirName);
         const mediaPath = path.join(groupPath, 'media');
         const usersMediaPath = path.join(mediaPath, 'users');
 
-        ensureDir(groupPath);
-        ensureDir(mediaPath);
-        ensureDir(usersMediaPath);
+        try {
+            ensureDir(groupPath);
+            ensureDir(mediaPath);
+            ensureDir(usersMediaPath);
+        } catch (dirError) {
+            logger.error({ error: dirError, path: groupPath }, `  Failed to create directories for group ${group.name}`);
+            continue;
+        }
 
         try {
-            // Collect all data for this group
-            const [groupInfo, groupMembers, messages] = await Promise.all([
-                collectGroupInfo(group, groupPath, mediaPath),
-                collectGroupMembers(group, usersMediaPath),
-                collectMessages(group, mediaPath, lidCache)
-            ]);
+            // Collect all data for this group with timing
+            logger.info('  - Fetching group info...');
+            const groupInfoStart = Date.now();
+            const groupInfo = await collectGroupInfo(group, groupPath, mediaPath);
+            logger.info(`  - Fetching group info... done. Took ${formatDuration(Date.now() - groupInfoStart)}`);
+
+            logger.info('  - Fetching members list...');
+            const membersStart = Date.now();
+            const groupMembers = await collectGroupMembers(group, usersMediaPath);
+            logger.info(`  - Fetching members list... done. Took ${formatDuration(Date.now() - membersStart)}`);
+
+            logger.info('  - Fetching messages...');
+            const messagesStart = Date.now();
+            const messages = await collectMessages(group, mediaPath, lidCache);
+            logger.info(`  - Fetching messages... done. Took ${formatDuration(Date.now() - messagesStart)}`);
+
 
             // Extract membership events (join/leave/removed) from system messages
             const membershipEvents = extractMembershipEvents(messages.rawMessages, lidCache);
@@ -637,19 +734,19 @@ async function processGroups(): Promise<void> {
                 path.join(groupPath, 'group_info.json'),
                 JSON.stringify(groupInfo, null, 4)
             );
-            console.log(`  - Saved group_info.json`);
+            logger.info('  - Saved group_info.json');
 
             fs.writeFileSync(
                 path.join(groupPath, 'group_members.json'),
                 JSON.stringify(groupMembers, null, 4)
             );
-            console.log(`  - Saved group_members.json (${groupMembers.length} members)`);
+            logger.info(`  - Saved group_members.json (${groupMembers.length} members)`);
 
             fs.writeFileSync(
                 path.join(groupPath, 'group_chat.json'),
                 JSON.stringify(messages.chatMessages, null, 4)
             );
-            console.log(`  - Saved group_chat.json (${messages.chatMessages.length} messages)`);
+            logger.info(`  - Saved group_chat.json (${messages.chatMessages.length} messages)`);
 
             // Save membership events if any were found
             if (membershipEvents.length > 0) {
@@ -657,7 +754,7 @@ async function processGroups(): Promise<void> {
                     path.join(groupPath, 'membership_events.json'),
                     JSON.stringify(membershipEvents, null, 4)
                 );
-                console.log(`  - Saved membership_events.json (${membershipEvents.length} events)`);
+                logger.info(`  - Saved membership_events.json (${membershipEvents.length} events)`);
             }
 
             // Collect and save poll votes
@@ -667,7 +764,7 @@ async function processGroups(): Promise<void> {
                     path.join(groupPath, 'group_votes.json'),
                     JSON.stringify(pollResult.votes, null, 4)
                 );
-                console.log(`  - Saved group_votes.json (${pollResult.votes.length} votes)`);
+                logger.info(`  - Saved group_votes.json (${pollResult.votes.length} votes)`);
             }
 
             // Save raw messages
@@ -702,7 +799,7 @@ async function processGroups(): Promise<void> {
                 path.join(groupPath, 'raw_messages.json'),
                 JSON.stringify(rawMessagesData, null, 4)
             );
-            console.log(`  - Saved raw_messages.json (${rawMessagesData.length} messages)`);
+            logger.info(`  - Saved raw_messages.json (${rawMessagesData.length} messages)`);
 
             // Combine and save all errors
             const allErrors: ErrorLogEntry[] = [
@@ -714,17 +811,17 @@ async function processGroups(): Promise<void> {
                     path.join(groupPath, 'error_log.json'),
                     JSON.stringify(allErrors, null, 4)
                 );
-                console.log(`  - Saved error_log.json (${allErrors.length} errors)`);
+                logger.info(`  - Saved error_log.json (${allErrors.length} errors)`);
             }
 
         } catch (error) {
-            console.error(`  Error processing group ${group.name}:`, error);
+            logger.error({ error }, `  Error processing group ${group.name}`);
         }
     }
 
     // Save updated LID cache
     saveLidMappingCache(avatarPath, lidCache);
-    console.log(`\nLID cache updated with ${Object.keys(lidCache.mappings).length} mappings`);
+    logger.info(`\nLID cache updated with ${Object.keys(lidCache.mappings).length} mappings`);
 }
 
 async function collectGroupInfo(group: GroupChat, groupPath: string, mediaPath: string): Promise<GroupInfo> {
@@ -742,17 +839,17 @@ async function collectGroupInfo(group: GroupChat, groupPath: string, mediaPath: 
             const fileName = `group_profile_photo.${ext}`;
             profilePicPath = path.join(mediaPath, fileName);
             await saveMedia(media, profilePicPath);
-            console.log(`  - Downloaded group profile picture`);
+            logger.debug('  - Downloaded group profile picture');
         }
     } catch (error) {
-        console.log(`  - Could not fetch group profile picture`);
+        logger.debug('  - Could not fetch group profile picture');
     }
 
     // Try to get invite code
     try {
         inviteCode = await group.getInviteCode();
     } catch (error) {
-        console.log(`  - Could not fetch invite code`);
+        logger.debug('  - Could not fetch invite code');
     }
 
     // Find first admin
@@ -801,7 +898,7 @@ async function collectGroupInfo(group: GroupChat, groupPath: string, mediaPath: 
             securitySettings.addMembersAdminsOnly = rawData.memberAddMode || false;
         }
     } catch (error) {
-        console.log(`  - Could not fetch security settings`);
+        logger.debug('  - Could not fetch security settings');
     }
 
     const groupInfo: GroupInfo = {
@@ -829,9 +926,15 @@ async function collectGroupMembers(group: GroupChat, usersMediaPath: string): Pr
     const members: GroupMember[] = [];
     const participants = group.participants || [];
 
-    console.log(`  - Processing ${participants.length} members...`);
+    logger.info(`  - Processing ${participants.length} members...`);
 
-    for (const participant of participants) {
+    let profilePicCount = 0;
+    const profilePicStartTime = Date.now();
+
+    for (let i = 0; i < participants.length; i++) {
+        const participant = participants[i];
+        const participantId = extractIdNumber(participant.id._serialized);
+        logger.debug(`    - Processing member ${i + 1}/${participants.length}: ${participantId}`);
         let contact: Contact | null = null;
         let profilePicPath: string | null = null;
         let about: string | null = null;
@@ -858,6 +961,7 @@ async function collectGroupMembers(group: GroupChat, usersMediaPath: string): Pr
                 const fileName = `${extractIdNumber(participant.id._serialized)}.${ext}`;
                 profilePicPath = path.join(usersMediaPath, fileName);
                 await saveMedia(media, profilePicPath);
+                profilePicCount++;
             }
         } catch (error) {
             // Profile picture not available
@@ -879,6 +983,10 @@ async function collectGroupMembers(group: GroupChat, usersMediaPath: string): Pr
         members.push(member);
     }
 
+    if (profilePicCount > 0) {
+        logger.info(`  - Downloaded ${profilePicCount} member profile pictures. Took ${formatDuration(Date.now() - profilePicStartTime)}`);
+    }
+
     return members;
 }
 
@@ -887,48 +995,41 @@ async function collectMessages(
     mediaPath: string,
     lidCache: LidMappingCache
 ): Promise<{ chatMessages: ChatMessage[]; rawMessages: Message[]; errors: ErrorLogEntry[] }> {
-    console.log(`  - Fetching messages...`);
     const errors: ErrorLogEntry[] = [];
 
-    // Load messages with retries to ensure we get historical messages
-    const TARGET_MESSAGES = 500;
-    const MAX_RETRIES = 10;
-    let retries = 0;
-    let allMessages = await group.fetchMessages({ limit: TARGET_MESSAGES });
-    console.log(`  - Initial fetch: ${allMessages.length} messages`);
+    // REVERT_COMMENT: Changed from 10 messages to 1 month unlimited - revert to original when requested
+    // REVERT_COMMENT: Original was: const TARGET_MESSAGES = 10; with retry logic
+    // Fetch all messages from the last month without limit
+    const ONE_MONTH_AGO = Math.floor(Date.now() / 1000) - (30 * 24 * 60 * 60);
+    let allMessages = await group.fetchMessages({ limit: Infinity });
+    logger.info(`  - Fetched ${allMessages.length} total messages`);
 
-    // Keep loading until we hit target or no more messages come in
-    while (allMessages.length < TARGET_MESSAGES && retries < MAX_RETRIES) {
-        const prevCount = allMessages.length;
-        await new Promise(resolve => setTimeout(resolve, 1000)); // Wait 1 second between loads
-        allMessages = await group.fetchMessages({ limit: TARGET_MESSAGES });
-        console.log(`  - Retry ${retries + 1}: ${allMessages.length} messages`);
-
-        // If no new messages loaded, stop retrying
-        if (allMessages.length === prevCount) {
-            console.log(`  - No new messages loaded, stopping`);
-            break;
-        }
-        retries++;
-    }
+    // Filter to messages from the last month
+    allMessages = allMessages.filter(msg => msg.timestamp >= ONE_MONTH_AGO);
+    logger.info(`  - Filtered to ${allMessages.length} messages from last month`);
+    // REVERT_COMMENT: End of one-month change
 
     // Filter messages based on FIRST_RUN setting
     let messages: Message[];
     if (FIRST_RUN) {
         // First run: get all messages without time filter
         messages = allMessages;
-        console.log(`  - FIRST_RUN mode: returning all ${allMessages.length} messages`);
+        logger.info(`  - FIRST_RUN mode: returning all ${allMessages.length} messages`);
     } else {
         // Normal run: filter to last 10 minutes only (rolling window)
         const tenMinutesAgo = Math.floor(Date.now() / 1000) - (10 * 60);
         messages = allMessages.filter(msg => msg.timestamp >= tenMinutesAgo);
-        console.log(`  - Found ${allMessages.length} total, filtered to ${messages.length} from last 10 minutes`);
+        logger.info(`  - Found ${allMessages.length} total, filtered to ${messages.length} from last 10 minutes`);
     }
 
     const chatMessages: ChatMessage[] = [];
     let mediaCount = 0;
+    const totalMessages = messages.length;
 
-    for (const msg of messages) {
+    for (let msgIndex = 0; msgIndex < messages.length; msgIndex++) {
+        const msg = messages[msgIndex];
+        logger.debug(`  - Processing message ${msgIndex + 1}/${totalMessages} (type: ${msg.type}, id: ${msg.id.id.substring(0, 8)}...)`);
+
         // Skip status/story messages
         if ((msg as any).isStatus) {
             continue;
@@ -985,7 +1086,11 @@ async function collectMessages(
         if (msg.hasMedia) {
             let downloadError: string | null = null;
             try {
-                const media = await msg.downloadMedia();
+                const media = await withTimeout(
+                    msg.downloadMedia(),
+                    MEDIA_DOWNLOAD_TIMEOUT,
+                    `Download timed out after ${MEDIA_DOWNLOAD_TIMEOUT}ms`
+                );
                 if (media) {
                     const ext = getMediaExtension(media.mimetype);
                     const msgIdSafe = msg.id.id.replace(/[^a-zA-Z0-9]/g, '_');
@@ -1003,7 +1108,7 @@ async function collectMessages(
             if (downloadError) {
                 isFailedToDownload = true;
                 const isOld = (Date.now() / 1000 - msg.timestamp) > 14 * 24 * 60 * 60; // >14 days
-                console.log(`    - Media download failed for ${msg.id.id}: ${downloadError}`);
+                logger.warn(`    - Media download failed for ${msg.id.id}: ${downloadError}`);
                 errors.push({
                     timestamp: getISOTimestamp(),
                     messageId: msg.id.id,
@@ -1199,7 +1304,7 @@ async function collectMessages(
     }
 
     if (mediaCount > 0) {
-        console.log(`  - Downloaded ${mediaCount} media files`);
+        logger.info(`  - Downloaded ${mediaCount} media files`);
     }
 
     return { chatMessages, rawMessages: messages, errors };
@@ -1209,9 +1314,9 @@ async function collectMessages(
 // Start the Client
 // ============================================================================
 
-console.log('Starting WhatsApp client...');
-console.log(`Avatar: ${AVATAR_NAME}`);
-console.log(`Data will be saved to: ${DATA_DIR}`);
-console.log('');
+logger.info('Starting WhatsApp client...');
+logger.info(`Avatar: ${AVATAR_NAME}`);
+logger.info(`Data will be saved to: ${DATA_DIR}`);
+logger.info('');
 
 client.initialize();
