@@ -3,11 +3,17 @@ import * as qrcode from 'qrcode-terminal';
 import * as fs from 'fs';
 import * as path from 'path';
 import 'dotenv/config';
+import pLimit from 'p-limit';
 import logger from './logger';
 
 // Environment configuration
-const FIRST_RUN = process.env.FIRST_RUN === 'true';
 const MEDIA_DOWNLOAD_TIMEOUT = parseInt(process.env.MEDIA_DOWNLOAD_TIMEOUT || '10000', 10);
+const MEMBER_FETCH_CONCURRENCY = parseInt(process.env.MEMBER_FETCH_CONCURRENCY || '5', 10);
+
+// Auth and scan configuration
+const AUTH_TIMEOUT_MS = parseInt(process.env.AUTH_TIMEOUT_MS || '300000', 10); // Default 5 minutes
+const AUTH_MAX_RETRIES = 3; // Maximum number of authentication attempts
+const INITIAL_SCAN_DAYS = 30; // Days to look back on first scan
 
 // ============================================================================
 // Type Definitions
@@ -152,6 +158,54 @@ interface LidMappingCache {
     mappings: Record<string, LidMapping>;
 }
 
+interface ScanMetadata {
+    version: string;
+    lastUpdated: string;
+    groups: Record<string, GroupScanInfo>;
+}
+
+interface GroupScanInfo {
+    groupId: string;
+    groupName: string;
+    lastScanTimestamp: string;
+    lastMessageTimestamp: number;
+    scanCount: number;
+}
+
+interface UserImageCache {
+    version: string;
+    lastUpdated: string;
+    images: Record<string, UserImageEntry>;
+}
+
+interface UserImageEntry {
+    userId: string;
+    imagePath: string;
+    downloadedAt: string;
+}
+
+interface PastMember {
+    id: string;
+    phoneNumber: string | null;
+    name: string | null;
+    leftAt: string;
+    leftReason: 'leave' | 'remove' | 'unknown';
+    removedBy: string | null;
+}
+
+interface InitializationAttempt {
+    timestamp: string;
+    attempt: number;
+    success: boolean;
+    reason?: string;
+    errorDetails?: string;
+}
+
+interface InitializationsLog {
+    lastUpdated: string;
+    attempts: InitializationAttempt[];
+}
+
 // ============================================================================
 // Configuration
 // ============================================================================
@@ -229,6 +283,153 @@ function withTimeout<T>(promise: Promise<T>, ms: number, errorMessage: string): 
         setTimeout(() => reject(new Error(errorMessage)), ms);
     });
     return Promise.race([promise, timeout]);
+}
+
+/**
+ * Returns UTC datetime string for use in file/folder paths.
+ * Format: YYYY-MM-DD_HH-mm (no colons for Windows compatibility)
+ */
+function getUTCDatetimeForPath(): string {
+    const now = new Date();
+    const year = now.getUTCFullYear();
+    const month = String(now.getUTCMonth() + 1).padStart(2, '0');
+    const day = String(now.getUTCDate()).padStart(2, '0');
+    const hour = String(now.getUTCHours()).padStart(2, '0');
+    const minute = String(now.getUTCMinutes()).padStart(2, '0');
+    return `${year}-${month}-${day}_${hour}-${minute}`;
+}
+
+// ============================================================================
+// Scan Metadata Functions
+// ============================================================================
+
+function getScanMetadataPath(avatarPath: string): string {
+    return path.join(avatarPath, 'scan_metadata.json');
+}
+
+function loadScanMetadata(avatarPath: string): ScanMetadata {
+    const metadataPath = getScanMetadataPath(avatarPath);
+    if (fs.existsSync(metadataPath)) {
+        try {
+            const data = fs.readFileSync(metadataPath, 'utf-8');
+            return JSON.parse(data);
+        } catch (error) {
+            logger.warn('Could not load scan metadata, creating new one');
+        }
+    }
+    return {
+        version: '1.0',
+        lastUpdated: getISOTimestamp(),
+        groups: {}
+    };
+}
+
+function saveScanMetadata(avatarPath: string, metadata: ScanMetadata): void {
+    const metadataPath = getScanMetadataPath(avatarPath);
+    metadata.lastUpdated = getISOTimestamp();
+    ensureDir(avatarPath);
+    fs.writeFileSync(metadataPath, JSON.stringify(metadata, null, 4));
+}
+
+function isFirstRunForGroup(metadata: ScanMetadata, groupId: string): boolean {
+    return !metadata.groups[groupId];
+}
+
+function getLastMessageTimestamp(metadata: ScanMetadata, groupId: string): number | null {
+    const groupInfo = metadata.groups[groupId];
+    return groupInfo?.lastMessageTimestamp ?? null;
+}
+
+// ============================================================================
+// User Image Cache Functions
+// ============================================================================
+
+function getUserImageCachePath(avatarPath: string): string {
+    return path.join(avatarPath, 'user_image_cache.json');
+}
+
+function loadUserImageCache(avatarPath: string): UserImageCache {
+    const cachePath = getUserImageCachePath(avatarPath);
+    if (fs.existsSync(cachePath)) {
+        try {
+            const data = fs.readFileSync(cachePath, 'utf-8');
+            return JSON.parse(data);
+        } catch (error) {
+            logger.warn('Could not load user image cache, creating new one');
+        }
+    }
+    return {
+        version: '1.0',
+        lastUpdated: getISOTimestamp(),
+        images: {}
+    };
+}
+
+function saveUserImageCache(avatarPath: string, cache: UserImageCache): void {
+    const cachePath = getUserImageCachePath(avatarPath);
+    cache.lastUpdated = getISOTimestamp();
+    ensureDir(avatarPath);
+    fs.writeFileSync(cachePath, JSON.stringify(cache, null, 4));
+}
+
+/**
+ * Checks if a user's profile picture is already cached and the file exists.
+ * Returns the cached path if found, null otherwise.
+ */
+function userImageExists(cache: UserImageCache, userId: string): string | null {
+    const entry = cache.images[userId];
+    if (entry && fs.existsSync(entry.imagePath)) {
+        return entry.imagePath;
+    }
+    return null;
+}
+
+/**
+ * Generates a filename for a user's profile picture with timestamp.
+ * Format: {userId}_{datetime_UTC}.{ext}
+ */
+function generateUserImageFilename(userId: string, ext: string): string {
+    const datetime = getUTCDatetimeForPath();
+    return `${userId}_${datetime}.${ext}`;
+}
+
+// ============================================================================
+// Past Members Functions
+// ============================================================================
+
+/**
+ * Aggregates past members from membership events.
+ * Identifies users who left or were removed and are not current members.
+ */
+function aggregatePastMembers(
+    membershipEvents: MembershipEvent[],
+    currentMembers: GroupMember[]
+): PastMember[] {
+    const currentMemberIds = new Set(currentMembers.map(m => m.id));
+    const pastMembersMap = new Map<string, PastMember>();
+
+    // Process events in chronological order
+    const sortedEvents = [...membershipEvents].sort((a, b) => a.timestamp - b.timestamp);
+
+    for (const event of sortedEvents) {
+        if (event.eventType === 'leave' || event.eventType === 'remove') {
+            for (const userId of event.affectedUsers) {
+                // Only track if not a current member
+                if (!currentMemberIds.has(userId)) {
+                    pastMembersMap.set(userId, {
+                        id: userId,
+                        phoneNumber: userId,
+                        name: null,
+                        leftAt: new Date(event.timestamp * 1000).toISOString(),
+                        leftReason: event.eventType,
+                        removedBy: event.performedBy
+                    });
+                }
+            }
+        }
+    }
+
+    return Array.from(pastMembersMap.values());
 }
 
 // ============================================================================
@@ -557,23 +758,10 @@ async function collectPollVotes(
 // WhatsApp Client Setup
 // ============================================================================
 
-const client = new Client({
-    authStrategy: new LocalAuth({
-        clientId: AVATAR_NAME,
-        dataPath: './.wwebjs_auth'
-    }),
-    puppeteer: {
-        headless: true,
-        args: ['--no-sandbox', '--disable-setuid-sandbox']
-    }
-});
-
-// ============================================================================
-// Graceful Shutdown
-// ============================================================================
-
+let client: Client;
 let isShuttingDown = false;
 let isClientReady = false;
+let authAttempts = 0;
 
 function serializeError(error: unknown): { message: string; stack?: string } {
     if (error instanceof Error) {
@@ -623,54 +811,178 @@ process.on('unhandledRejection', (reason) => {
 });
 
 // ============================================================================
-// Event Handlers
+// Authentication with Retry
 // ============================================================================
 
-client.on('qr', (qr: string) => {
-    logger.info('\n========================================');
-    logger.info('Scan this QR code with WhatsApp:');
-    logger.info('========================================\n');
-    qrcode.generate(qr, { small: true });
-});
+/**
+ * Logs an initialization attempt (success or failure) to initializations.json.
+ */
+function logInitializationAttempt(avatarPath: string, success: boolean, reason?: string): void {
+    const logPath = path.join(avatarPath, 'initializations.json');
+    ensureDir(avatarPath);
 
-client.on('authenticated', () => {
-    logger.info('Authenticated successfully!');
-});
-
-client.on('auth_failure', (msg: string) => {
-    logger.fatal({ error: msg }, 'Authentication failed');
-    gracefulShutdown(1, 'auth_failure');
-});
-
-client.on('disconnected', (reason: string) => {
-    logger.warn(`Client disconnected: ${reason}`);
-    gracefulShutdown(1, `disconnected: ${reason}`);
-});
-
-client.on('ready', async () => {
-    isClientReady = true;
-    logger.info('\n========================================');
-    logger.info('WhatsApp Client is ready!');
-    logger.info('========================================\n');
-
-    try {
-        await processGroups();
-        logger.info('\nData collection complete!');
-        await gracefulShutdown(0, 'complete');
-    } catch (error) {
-        logger.error({ err: serializeError(error) }, 'Error processing groups');
-        await gracefulShutdown(1, 'processing_error');
+    // Load existing log or create new one
+    let log: InitializationsLog;
+    if (fs.existsSync(logPath)) {
+        try {
+            log = JSON.parse(fs.readFileSync(logPath, 'utf-8'));
+        } catch {
+            log = { lastUpdated: getISOTimestamp(), attempts: [] };
+        }
+    } else {
+        log = { lastUpdated: getISOTimestamp(), attempts: [] };
     }
-});
+
+    // Add new attempt
+    const attempt: InitializationAttempt = {
+        timestamp: getISOTimestamp(),
+        attempt: authAttempts,
+        success: success
+    };
+    if (reason) {
+        attempt.reason = reason;
+        attempt.errorDetails = reason;
+    }
+
+    log.attempts.push(attempt);
+    log.lastUpdated = getISOTimestamp();
+
+    fs.writeFileSync(logPath, JSON.stringify(log, null, 4));
+
+    if (success) {
+        logger.info(`Initialization succeeded on attempt ${authAttempts}. Logged to ${logPath}`);
+    } else {
+        logger.warn(`Initialization attempt ${authAttempts} failed: ${reason}. Logged to ${logPath}`);
+    }
+}
+
+/**
+ * Sets up event handlers on the client.
+ */
+function setupEventHandlers(clientInstance: Client): void {
+    clientInstance.on('qr', (qr: string) => {
+        logger.info('\n========================================');
+        logger.info('Scan this QR code with WhatsApp:');
+        logger.info('========================================\n');
+        qrcode.generate(qr, { small: true });
+    });
+
+    clientInstance.on('authenticated', () => {
+        logger.info('Authenticated successfully!');
+    });
+
+    clientInstance.on('disconnected', (reason: string) => {
+        logger.warn(`Client disconnected: ${reason}`);
+    });
+
+    clientInstance.on('ready', async () => {
+        isClientReady = true;
+        logger.info('\n========================================');
+        logger.info('WhatsApp Client is ready!');
+        logger.info('========================================\n');
+
+        try {
+            await processGroups();
+            logger.info('\nData collection complete!');
+            await gracefulShutdown(0, 'complete');
+        } catch (error) {
+            logger.error({ err: serializeError(error) }, 'Error processing groups');
+            await gracefulShutdown(1, 'processing_error');
+        }
+    });
+}
+
+/**
+ * Initializes the WhatsApp client with retry logic.
+ * Waits max 60 seconds for authentication, retries up to 3 times.
+ */
+async function initializeWithRetry(): Promise<boolean> {
+    const avatarPath = path.join(DATA_DIR, AVATAR_NAME);
+    ensureDir(avatarPath);
+
+    for (let attempt = 1; attempt <= AUTH_MAX_RETRIES; attempt++) {
+        authAttempts = attempt;
+        logger.info(`\nAuthentication attempt ${attempt}/${AUTH_MAX_RETRIES}`);
+
+        // Reset state for new attempt
+        isClientReady = false;
+        isShuttingDown = false;
+
+        // Create new client instance
+        client = new Client({
+            authStrategy: new LocalAuth({
+                clientId: AVATAR_NAME,
+                dataPath: './.wwebjs_auth'
+            }),
+            puppeteer: {
+                headless: true,
+                args: ['--no-sandbox', '--disable-setuid-sandbox']
+            }
+        });
+
+        // Setup event handlers
+        setupEventHandlers(client);
+
+        try {
+            // Create promise that resolves when client is ready or rejects on auth failure
+            const authPromise = new Promise<void>((resolve, reject) => {
+                client.on('ready', () => resolve());
+                client.on('auth_failure', (msg: string) => reject(new Error(`Auth failed: ${msg}`)));
+            });
+
+            // Start initialization
+            client.initialize();
+            logger.info(`Waiting up to ${AUTH_TIMEOUT_MS / 60000} minutes for authentication...`);
+
+            // Wait for ready with timeout
+            await withTimeout(
+                authPromise,
+                AUTH_TIMEOUT_MS,
+                `Authentication timeout after ${AUTH_TIMEOUT_MS / 1000} seconds`
+            );
+
+            // If we reach here, authentication succeeded
+            logger.info('Client initialized successfully!');
+            logInitializationAttempt(avatarPath, true);
+            return true;
+
+        } catch (error) {
+            const errorMessage = error instanceof Error ? error.message : String(error);
+            logInitializationAttempt(avatarPath, false, errorMessage);
+
+            // Cleanup before retry
+            try {
+                await client.destroy();
+            } catch (e) {
+                // Ignore cleanup errors
+            }
+
+            if (attempt === AUTH_MAX_RETRIES) {
+                // All retries exhausted
+                logger.error(`Authentication failed after ${authAttempts} attempts`);
+                return false;
+            }
+
+            // Wait 2 seconds before retry
+            logger.info('Waiting 2 seconds before retry...');
+            await new Promise(r => setTimeout(r, 2000));
+        }
+    }
+
+    return false;
+}
 
 // ============================================================================
 // Data Collection Functions
 // ============================================================================
 
 async function processGroups(): Promise<void> {
-    const scanTimestamp = getCurrentTimestamp();
+    const scanTimestamp = getUTCDatetimeForPath();
     const avatarPath = path.join(DATA_DIR, AVATAR_NAME);
-    const basePath = path.join(avatarPath, scanTimestamp);
+
+    // Load scan metadata and user image cache
+    const scanMetadata = loadScanMetadata(avatarPath);
+    let userImageCache = loadUserImageCache(avatarPath);
 
     // Build LID mapping cache from contacts
     const lidCache = await buildLidMappingFromContacts(client, avatarPath);
@@ -692,19 +1004,24 @@ async function processGroups(): Promise<void> {
         const group = groupsToProcess[i];
         logger.info(`\n[${i + 1}/${groupsToProcess.length}] Processing group: ${group.name}`);
 
-        // if (group.name !== "רותם - יניב - הראל - דביר") { continue }
         const groupId = extractIdNumber(group.id._serialized);
         const groupDirName = `${sanitizeFileName(group.name)}_${groupId}`;
-        const groupPath = path.join(basePath, groupDirName);
-        const mediaPath = path.join(groupPath, 'media');
-        const usersMediaPath = path.join(mediaPath, 'users');
+
+        // New directory structure: avatar/group/{media,scan_timestamp/}
+        const groupBasePath = path.join(avatarPath, groupDirName);
+        const groupMediaPath = path.join(groupBasePath, 'media');
+        const usersMediaPath = path.join(groupMediaPath, 'users');
+        const scanPath = path.join(groupBasePath, scanTimestamp);
+        const scanMediaPath = path.join(scanPath, 'media');
 
         try {
-            ensureDir(groupPath);
-            ensureDir(mediaPath);
+            ensureDir(groupBasePath);
+            ensureDir(groupMediaPath);
             ensureDir(usersMediaPath);
+            ensureDir(scanPath);
+            ensureDir(scanMediaPath);
         } catch (dirError) {
-            logger.error({ error: dirError, path: groupPath }, `  Failed to create directories for group ${group.name}`);
+            logger.error({ error: dirError, path: groupBasePath }, `  Failed to create directories for group ${group.name}`);
             continue;
         }
 
@@ -712,38 +1029,42 @@ async function processGroups(): Promise<void> {
             // Collect all data for this group with timing
             logger.info('  - Fetching group info...');
             const groupInfoStart = Date.now();
-            const groupInfo = await collectGroupInfo(group, groupPath, mediaPath);
+            const groupInfo = await collectGroupInfo(group, scanPath, scanMediaPath);
             logger.info(`  - Fetching group info... done. Took ${formatDuration(Date.now() - groupInfoStart)}`);
 
             logger.info('  - Fetching members list...');
             const membersStart = Date.now();
-            const groupMembers = await collectGroupMembers(group, usersMediaPath);
+            const membersResult = await collectGroupMembers(group, usersMediaPath, userImageCache);
+            const groupMembers = membersResult.members;
+            userImageCache = membersResult.updatedCache;
             logger.info(`  - Fetching members list... done. Took ${formatDuration(Date.now() - membersStart)}`);
 
             logger.info('  - Fetching messages...');
             const messagesStart = Date.now();
-            const messages = await collectMessages(group, mediaPath, lidCache);
+            const messages = await collectMessages(group, scanMediaPath, lidCache, scanMetadata, groupId);
             logger.info(`  - Fetching messages... done. Took ${formatDuration(Date.now() - messagesStart)}`);
-
 
             // Extract membership events (join/leave/removed) from system messages
             const membershipEvents = extractMembershipEvents(messages.rawMessages, lidCache);
 
-            // Save all JSON files
+            // Aggregate past members from membership events
+            const pastMembers = aggregatePastMembers(membershipEvents, groupMembers);
+
+            // Save all JSON files to scan folder
             fs.writeFileSync(
-                path.join(groupPath, 'group_info.json'),
+                path.join(scanPath, 'group_info.json'),
                 JSON.stringify(groupInfo, null, 4)
             );
             logger.info('  - Saved group_info.json');
 
             fs.writeFileSync(
-                path.join(groupPath, 'group_members.json'),
+                path.join(scanPath, 'group_members.json'),
                 JSON.stringify(groupMembers, null, 4)
             );
             logger.info(`  - Saved group_members.json (${groupMembers.length} members)`);
 
             fs.writeFileSync(
-                path.join(groupPath, 'group_chat.json'),
+                path.join(scanPath, 'group_chat.json'),
                 JSON.stringify(messages.chatMessages, null, 4)
             );
             logger.info(`  - Saved group_chat.json (${messages.chatMessages.length} messages)`);
@@ -751,17 +1072,26 @@ async function processGroups(): Promise<void> {
             // Save membership events if any were found
             if (membershipEvents.length > 0) {
                 fs.writeFileSync(
-                    path.join(groupPath, 'membership_events.json'),
+                    path.join(scanPath, 'membership_events.json'),
                     JSON.stringify(membershipEvents, null, 4)
                 );
                 logger.info(`  - Saved membership_events.json (${membershipEvents.length} events)`);
+            }
+
+            // Save past members if any were found
+            if (pastMembers.length > 0) {
+                fs.writeFileSync(
+                    path.join(scanPath, 'past_members.json'),
+                    JSON.stringify(pastMembers, null, 4)
+                );
+                logger.info(`  - Saved past_members.json (${pastMembers.length} former members inferred)`);
             }
 
             // Collect and save poll votes
             const pollResult = await collectPollVotes(messages.rawMessages, lidCache);
             if (pollResult.votes.length > 0) {
                 fs.writeFileSync(
-                    path.join(groupPath, 'group_votes.json'),
+                    path.join(scanPath, 'group_votes.json'),
                     JSON.stringify(pollResult.votes, null, 4)
                 );
                 logger.info(`  - Saved group_votes.json (${pollResult.votes.length} votes)`);
@@ -796,7 +1126,7 @@ async function processGroups(): Promise<void> {
                 return baseData;
             }));
             fs.writeFileSync(
-                path.join(groupPath, 'raw_messages.json'),
+                path.join(scanPath, 'raw_messages.json'),
                 JSON.stringify(rawMessagesData, null, 4)
             );
             logger.info(`  - Saved raw_messages.json (${rawMessagesData.length} messages)`);
@@ -808,20 +1138,35 @@ async function processGroups(): Promise<void> {
             ];
             if (allErrors.length > 0) {
                 fs.writeFileSync(
-                    path.join(groupPath, 'error_log.json'),
+                    path.join(scanPath, 'error_log.json'),
                     JSON.stringify(allErrors, null, 4)
                 );
                 logger.info(`  - Saved error_log.json (${allErrors.length} errors)`);
             }
+
+            // Update scan metadata for this group
+            scanMetadata.groups[groupId] = {
+                groupId: groupId,
+                groupName: group.name,
+                lastScanTimestamp: getISOTimestamp(),
+                lastMessageTimestamp: messages.newestTimestamp,
+                scanCount: (scanMetadata.groups[groupId]?.scanCount || 0) + 1
+            };
 
         } catch (error) {
             logger.error({ error }, `  Error processing group ${group.name}`);
         }
     }
 
-    // Save updated LID cache
+    // Save updated caches
     saveLidMappingCache(avatarPath, lidCache);
     logger.info(`\nLID cache updated with ${Object.keys(lidCache.mappings).length} mappings`);
+
+    saveScanMetadata(avatarPath, scanMetadata);
+    logger.info(`Scan metadata updated for ${Object.keys(scanMetadata.groups).length} groups`);
+
+    saveUserImageCache(avatarPath, userImageCache);
+    logger.info(`User image cache updated with ${Object.keys(userImageCache.images).length} images`);
 }
 
 async function collectGroupInfo(group: GroupChat, groupPath: string, mediaPath: string): Promise<GroupInfo> {
@@ -921,105 +1266,145 @@ async function collectGroupInfo(group: GroupChat, groupPath: string, mediaPath: 
     return groupInfo;
 }
 
-async function collectGroupMembers(group: GroupChat, usersMediaPath: string): Promise<GroupMember[]> {
+async function collectGroupMembers(
+    group: GroupChat,
+    usersMediaPath: string,
+    userImageCache: UserImageCache
+): Promise<{ members: GroupMember[]; updatedCache: UserImageCache }> {
     const timestamp = getISOTimestamp();
-    const members: GroupMember[] = [];
     const participants = group.participants || [];
 
-    logger.info(`  - Processing ${participants.length} members...`);
+    logger.info(`  - Processing ${participants.length} members (concurrency: ${MEMBER_FETCH_CONCURRENCY})...`);
 
-    let profilePicCount = 0;
     const profilePicStartTime = Date.now();
+    const limit = pLimit(MEMBER_FETCH_CONCURRENCY);
 
-    for (let i = 0; i < participants.length; i++) {
-        const participant = participants[i];
-        const participantId = extractIdNumber(participant.id._serialized);
-        logger.debug(`    - Processing member ${i + 1}/${participants.length}: ${participantId}`);
-        let contact: Contact | null = null;
-        let profilePicPath: string | null = null;
-        let about: string | null = null;
+    // Process members in parallel with controlled concurrency
+    const memberResults = await Promise.all(
+        participants.map((participant, i) =>
+            limit(async () => {
+                const participantId = extractIdNumber(participant.id._serialized);
+                logger.debug(`    - Processing member ${i + 1}/${participants.length}: ${participantId}`);
 
-        try {
-            contact = await client.getContactById(participant.id._serialized);
+                let contact: Contact | null = null;
+                let profilePicPath: string | null = null;
+                let about: string | null = null;
+                let picSource: 'downloaded' | 'cached' | 'none' = 'none';
 
-            // Try to get about/status text
-            try {
-                about = await contact.getAbout();
-            } catch (error) {
-                // About not available due to privacy settings
-            }
-        } catch (error) {
-            // Contact info not available
-        }
+                try {
+                    contact = await client.getContactById(participant.id._serialized);
 
-        // Try to download profile picture
-        try {
-            const profilePicUrl = await client.getProfilePicUrl(participant.id._serialized);
-            if (profilePicUrl) {
-                const media = await MessageMedia.fromUrl(profilePicUrl);
-                const ext = getMediaExtension(media.mimetype);
-                const fileName = `${extractIdNumber(participant.id._serialized)}.${ext}`;
-                profilePicPath = path.join(usersMediaPath, fileName);
-                await saveMedia(media, profilePicPath);
-                profilePicCount++;
-            }
-        } catch (error) {
-            // Profile picture not available
-        }
+                    // Try to get about/status text
+                    try {
+                        about = await contact.getAbout();
+                    } catch (error) {
+                        // About not available due to privacy settings
+                    }
+                } catch (error) {
+                    // Contact info not available
+                }
 
-        const member: GroupMember = {
-            id: extractIdNumber(participant.id._serialized),
-            phoneNumber: contact?.number || '',
-            user: contact?.pushname || null,
-            name: contact?.name || contact?.pushname || extractIdNumber(participant.id._serialized),
-            role: participant.isSuperAdmin ? 'superadmin' : (participant.isAdmin ? 'admin' : 'member'),
-            isAdmin: participant.isAdmin || participant.isSuperAdmin,
-            isSuperAdmin: participant.isSuperAdmin || false,
-            profile_picture_path: profilePicPath,
-            timestamp: timestamp,
-            about: about
-        };
+                // Check cache first for profile picture
+                const cachedPath = userImageExists(userImageCache, participantId);
+                if (cachedPath) {
+                    profilePicPath = cachedPath;
+                    picSource = 'cached';
+                    logger.debug(`    - Using cached profile picture for ${participantId}`);
+                } else {
+                    // Not cached, try to download profile picture
+                    try {
+                        const profilePicUrl = await client.getProfilePicUrl(participant.id._serialized);
+                        if (profilePicUrl) {
+                            const media = await MessageMedia.fromUrl(profilePicUrl);
+                            const ext = getMediaExtension(media.mimetype);
+                            // New filename format: {id}_{datetime_UTC}.{ext}
+                            const fileName = generateUserImageFilename(participantId, ext);
+                            profilePicPath = path.join(usersMediaPath, fileName);
+                            await saveMedia(media, profilePicPath);
+                            picSource = 'downloaded';
 
-        members.push(member);
+                            // Update cache with new download
+                            userImageCache.images[participantId] = {
+                                userId: participantId,
+                                imagePath: profilePicPath,
+                                downloadedAt: getISOTimestamp()
+                            };
+                        }
+                    } catch (error) {
+                        // Profile picture not available
+                    }
+                }
+
+                const member: GroupMember = {
+                    id: extractIdNumber(participant.id._serialized),
+                    phoneNumber: contact?.number || '',
+                    user: contact?.pushname || null,
+                    name: contact?.name || contact?.pushname || extractIdNumber(participant.id._serialized),
+                    role: participant.isSuperAdmin ? 'superadmin' : (participant.isAdmin ? 'admin' : 'member'),
+                    isAdmin: participant.isAdmin || participant.isSuperAdmin,
+                    isSuperAdmin: participant.isSuperAdmin || false,
+                    profile_picture_path: profilePicPath,
+                    timestamp: timestamp,
+                    about: about
+                };
+
+                return { member, picSource };
+            })
+        )
+    );
+
+    // Aggregate results
+    const members = memberResults.map(r => r.member);
+    const profilePicCount = memberResults.filter(r => r.picSource === 'downloaded').length;
+    const cachedPicCount = memberResults.filter(r => r.picSource === 'cached').length;
+
+    if (profilePicCount > 0 || cachedPicCount > 0) {
+        logger.info(`  - Profile pictures: ${profilePicCount} downloaded, ${cachedPicCount} from cache. Took ${formatDuration(Date.now() - profilePicStartTime)}`);
     }
 
-    if (profilePicCount > 0) {
-        logger.info(`  - Downloaded ${profilePicCount} member profile pictures. Took ${formatDuration(Date.now() - profilePicStartTime)}`);
-    }
-
-    return members;
+    return { members, updatedCache: userImageCache };
 }
 
 async function collectMessages(
     group: GroupChat,
     mediaPath: string,
-    lidCache: LidMappingCache
-): Promise<{ chatMessages: ChatMessage[]; rawMessages: Message[]; errors: ErrorLogEntry[] }> {
+    lidCache: LidMappingCache,
+    scanMetadata: ScanMetadata,
+    groupId: string
+): Promise<{ chatMessages: ChatMessage[]; rawMessages: Message[]; errors: ErrorLogEntry[]; newestTimestamp: number }> {
     const errors: ErrorLogEntry[] = [];
 
-    // REVERT_COMMENT: Changed from 10 messages to 1 month unlimited - revert to original when requested
-    // REVERT_COMMENT: Original was: const TARGET_MESSAGES = 10; with retry logic
-    // Fetch all messages from the last month without limit
-    const ONE_MONTH_AGO = Math.floor(Date.now() / 1000) - (30 * 24 * 60 * 60);
+    // Determine if this is the first run for this group
+    const isFirstRun = isFirstRunForGroup(scanMetadata, groupId);
+    const lastMessageTs = getLastMessageTimestamp(scanMetadata, groupId);
+
+    // Calculate cutoff timestamp based on first run or delta
+    let cutoffTimestamp: number;
+    if (isFirstRun) {
+        // First run: get 30 days of history
+        cutoffTimestamp = Math.floor(Date.now() / 1000) - (INITIAL_SCAN_DAYS * 24 * 60 * 60);
+        logger.info(`  - First scan for group: fetching ${INITIAL_SCAN_DAYS} days of messages`);
+    } else {
+        // Delta: get messages newer than last scan (but cap at 30 days for safety)
+        const thirtyDaysAgo = Math.floor(Date.now() / 1000) - (INITIAL_SCAN_DAYS * 24 * 60 * 60);
+        cutoffTimestamp = lastMessageTs ? Math.max(lastMessageTs, thirtyDaysAgo) : thirtyDaysAgo;
+        logger.info(`  - Delta scan: fetching messages since ${new Date(cutoffTimestamp * 1000).toISOString()}`);
+    }
+
+    // Fetch all messages
     let allMessages = await group.fetchMessages({ limit: Infinity });
     logger.info(`  - Fetched ${allMessages.length} total messages`);
 
-    // Filter to messages from the last month
-    allMessages = allMessages.filter(msg => msg.timestamp >= ONE_MONTH_AGO);
-    logger.info(`  - Filtered to ${allMessages.length} messages from last month`);
-    // REVERT_COMMENT: End of one-month change
+    // Filter messages based on cutoff timestamp
+    const messages = allMessages.filter(msg => msg.timestamp > cutoffTimestamp);
+    logger.info(`  - Filtered to ${messages.length} messages since cutoff`);
 
-    // Filter messages based on FIRST_RUN setting
-    let messages: Message[];
-    if (FIRST_RUN) {
-        // First run: get all messages without time filter
-        messages = allMessages;
-        logger.info(`  - FIRST_RUN mode: returning all ${allMessages.length} messages`);
-    } else {
-        // Normal run: filter to last 10 minutes only (rolling window)
-        const tenMinutesAgo = Math.floor(Date.now() / 1000) - (10 * 60);
-        messages = allMessages.filter(msg => msg.timestamp >= tenMinutesAgo);
-        logger.info(`  - Found ${allMessages.length} total, filtered to ${messages.length} from last 10 minutes`);
+    // Track newest message timestamp for next delta scan
+    let newestTimestamp = cutoffTimestamp;
+    for (const msg of messages) {
+        if (msg.timestamp > newestTimestamp) {
+            newestTimestamp = msg.timestamp;
+        }
     }
 
     const chatMessages: ChatMessage[] = [];
@@ -1307,16 +1692,28 @@ async function collectMessages(
         logger.info(`  - Downloaded ${mediaCount} media files`);
     }
 
-    return { chatMessages, rawMessages: messages, errors };
+    return { chatMessages, rawMessages: messages, errors, newestTimestamp };
 }
 
 // ============================================================================
 // Start the Client
 // ============================================================================
 
-logger.info('Starting WhatsApp client...');
-logger.info(`Avatar: ${AVATAR_NAME}`);
-logger.info(`Data will be saved to: ${DATA_DIR}`);
-logger.info('');
+async function main(): Promise<void> {
+    logger.info('Starting WhatsApp client...');
+    logger.info(`Avatar: ${AVATAR_NAME}`);
+    logger.info(`Data will be saved to: ${DATA_DIR}`);
+    logger.info('');
 
-client.initialize();
+    const success = await initializeWithRetry();
+
+    if (!success) {
+        logger.fatal('Failed to authenticate after all retries');
+        process.exit(1);
+    }
+}
+
+main().catch((error) => {
+    logger.fatal({ err: serializeError(error) }, 'Unhandled error in main');
+    process.exit(1);
+});
