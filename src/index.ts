@@ -9,6 +9,7 @@ import logger from './logger';
 // Environment configuration
 const MEDIA_DOWNLOAD_TIMEOUT = parseInt(process.env.MEDIA_DOWNLOAD_TIMEOUT || '10000', 10);
 const MEMBER_FETCH_CONCURRENCY = parseInt(process.env.MEMBER_FETCH_CONCURRENCY || '5', 10);
+const HISTORY_SYNC_WAIT_MS = parseInt(process.env.HISTORY_SYNC_WAIT_MS || '3000', 10);
 
 // Auth and scan configuration
 const AUTH_TIMEOUT_MS = parseInt(process.env.AUTH_TIMEOUT_MS || '300000', 10); // Default 5 minutes
@@ -1391,8 +1392,37 @@ async function collectMessages(
         logger.info(`  - Delta scan: fetching messages since ${new Date(cutoffTimestamp * 1000).toISOString()}`);
     }
 
+    // Sync message history from phone first (loads older messages)
+    // Try multiple times as WhatsApp loads history incrementally
+    const MAX_SYNC_ATTEMPTS = 3;
+
+    // Debug: Check the endOfHistoryTransferType value
+    try {
+        const chatData = (group as any).rawData || (group as any)._data || {};
+        logger.debug(`  - Chat endOfHistoryTransferType: ${chatData.endOfHistoryTransferType}`);
+    } catch (e) {
+        // ignore
+    }
+
+    for (let attempt = 1; attempt <= MAX_SYNC_ATTEMPTS; attempt++) {
+        try {
+            const syncResult = await group.syncHistory();
+            if (syncResult) {
+                logger.info(`  - Syncing message history from phone (attempt ${attempt}/${MAX_SYNC_ATTEMPTS}, waiting ${HISTORY_SYNC_WAIT_MS}ms)...`);
+                // Wait for sync to complete (messages are loaded asynchronously)
+                await new Promise(resolve => setTimeout(resolve, HISTORY_SYNC_WAIT_MS));
+            } else {
+                logger.debug(`  - No additional history to sync (attempt ${attempt})`);
+                break; // No more history available
+            }
+        } catch (error) {
+            logger.debug(`  - Could not sync history (attempt ${attempt}): ${error}`);
+            break;
+        }
+    }
+
     // Fetch all messages
-    let allMessages = await group.fetchMessages({ limit: Infinity });
+    let allMessages = await group.fetchMessages({ limit: 1000000000000 });
     logger.info(`  - Fetched ${allMessages.length} total messages`);
 
     // Filter messages based on cutoff timestamp
