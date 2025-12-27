@@ -6,7 +6,9 @@
   "scripts": {
     "start": "ts-node src/index.ts",
     "build": "tsc",
-    "start:prod": "node dist/index.js"
+    "start:prod": "node dist/index.js",
+    "scheduler": "ts-node src/scheduler.ts",
+    "scheduler:prod": "node dist/scheduler.js"
   },
   "keywords": [
     "whatsapp",

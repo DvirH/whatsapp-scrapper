@@ -9,6 +9,7 @@ import logger from './logger';
 // Environment configuration
 const MEDIA_DOWNLOAD_TIMEOUT = parseInt(process.env.MEDIA_DOWNLOAD_TIMEOUT || '10000', 10);
 const MEMBER_FETCH_CONCURRENCY = parseInt(process.env.MEMBER_FETCH_CONCURRENCY || '5', 10);
+const MEDIA_DOWNLOAD_CONCURRENCY = parseInt(process.env.MEDIA_DOWNLOAD_CONCURRENCY || '5', 10);
 const HISTORY_SYNC_WAIT_MS = parseInt(process.env.HISTORY_SYNC_WAIT_MS || '3000', 10);
 
 // Auth and scan configuration
@@ -200,20 +201,62 @@ interface InitializationAttempt {
     success: boolean;
     reason?: string;
     errorDetails?: string;
+    scanTiming?: ScanTiming;
 }
 
 interface InitializationsLog {
     lastUpdated: string;
     attempts: InitializationAttempt[];
+    currentScan?: ScanTiming;
+}
+
+interface ScanTiming {
+    scanStartTime: string;
+    scanFinishTime?: string;
+    scanStatus: 'in_progress' | 'completed' | 'failed';
+    scanDurationMs?: number;
+    groupsProcessed?: number;
+    errorMessage?: string;
 }
 
 // ============================================================================
 // Configuration
 // ============================================================================
 
-const AVATAR_NAME = 'S62'; // Change this per user/session
+let AVATAR_NAME: string; // Set dynamically via CLI argument or env var
 const MAX_GROUPS = Infinity; // Only process first 2 groups
 const DATA_DIR = path.join(process.cwd(), 'data');
+
+/**
+ * Parse avatar name from CLI arguments or environment variable.
+ * Supports: --avatar=NAME, -a NAME, or AVATAR_NAME env var
+ */
+function getAvatarName(): string {
+    const args = process.argv.slice(2);
+
+    for (let i = 0; i < args.length; i++) {
+        const arg = args[i];
+        // Handle --avatar=VALUE format
+        if (arg.startsWith('--avatar=')) {
+            return arg.split('=')[1];
+        }
+        // Handle -a VALUE or --avatar VALUE format
+        if (arg === '-a' || arg === '--avatar') {
+            if (args[i + 1] && !args[i + 1].startsWith('-')) {
+                return args[i + 1];
+            }
+        }
+    }
+
+    // Check environment variable
+    if (process.env.AVATAR_NAME) {
+        return process.env.AVATAR_NAME;
+    }
+
+    throw new Error(
+        'Avatar name is required. Use --avatar=NAME, -a NAME, or set AVATAR_NAME environment variable.'
+    );
+}
 
 // ============================================================================
 // Utility Functions
@@ -858,6 +901,68 @@ function logInitializationAttempt(avatarPath: string, success: boolean, reason?:
 }
 
 /**
+ * Updates the scan status in initializations.json.
+ * Tracks scan start/finish times, duration, and number of groups processed.
+ */
+function updateScanStatus(
+    avatarPath: string,
+    status: 'in_progress' | 'completed' | 'failed',
+    options?: { groupsProcessed?: number; errorMessage?: string }
+): void {
+    const logPath = path.join(avatarPath, 'initializations.json');
+    ensureDir(avatarPath);
+
+    // Load existing log or create new one
+    let log: InitializationsLog;
+    if (fs.existsSync(logPath)) {
+        try {
+            log = JSON.parse(fs.readFileSync(logPath, 'utf-8'));
+        } catch {
+            log = { lastUpdated: getISOTimestamp(), attempts: [] };
+        }
+    } else {
+        log = { lastUpdated: getISOTimestamp(), attempts: [] };
+    }
+
+    const now = getISOTimestamp();
+
+    if (status === 'in_progress') {
+        // Starting a new scan
+        log.currentScan = {
+            scanStartTime: now,
+            scanStatus: 'in_progress'
+        };
+    } else {
+        // Completing or failing a scan
+        const startTime = log.currentScan?.scanStartTime;
+        const scanDurationMs = startTime
+            ? new Date(now).getTime() - new Date(startTime).getTime()
+            : undefined;
+
+        log.currentScan = {
+            scanStartTime: startTime || now,
+            scanFinishTime: now,
+            scanStatus: status,
+            scanDurationMs,
+            groupsProcessed: options?.groupsProcessed,
+            errorMessage: options?.errorMessage
+        };
+
+        // Also update the most recent successful attempt with scan timing
+        if (log.attempts.length > 0) {
+            const lastAttempt = log.attempts[log.attempts.length - 1];
+            if (lastAttempt.success) {
+                lastAttempt.scanTiming = { ...log.currentScan };
+            }
+        }
+    }
+
+    log.lastUpdated = now;
+    fs.writeFileSync(logPath, JSON.stringify(log, null, 4));
+    logger.info(`Scan status updated to '${status}' for avatar ${AVATAR_NAME}`);
+}
+
+/**
  * Sets up event handlers on the client.
  */
 function setupEventHandlers(clientInstance: Client): void {
@@ -882,11 +987,17 @@ function setupEventHandlers(clientInstance: Client): void {
         logger.info('WhatsApp Client is ready!');
         logger.info('========================================\n');
 
+        const avatarPath = path.join(DATA_DIR, AVATAR_NAME);
+        updateScanStatus(avatarPath, 'in_progress');
+
         try {
-            await processGroups();
+            const result = await processGroups();
+            updateScanStatus(avatarPath, 'completed', { groupsProcessed: result.groupsProcessed });
             logger.info('\nData collection complete!');
             await gracefulShutdown(0, 'complete');
         } catch (error) {
+            const errorMessage = error instanceof Error ? error.message : String(error);
+            updateScanStatus(avatarPath, 'failed', { errorMessage });
             logger.error({ err: serializeError(error) }, 'Error processing groups');
             await gracefulShutdown(1, 'processing_error');
         }
@@ -977,9 +1088,10 @@ async function initializeWithRetry(): Promise<boolean> {
 // Data Collection Functions
 // ============================================================================
 
-async function processGroups(): Promise<void> {
+async function processGroups(): Promise<{ success: boolean; groupsProcessed: number }> {
     const scanTimestamp = getUTCDatetimeForPath();
     const avatarPath = path.join(DATA_DIR, AVATAR_NAME);
+    let groupsProcessedCount = 0;
 
     // Load scan metadata and user image cache
     const scanMetadata = loadScanMetadata(avatarPath);
@@ -1154,6 +1266,8 @@ async function processGroups(): Promise<void> {
                 scanCount: (scanMetadata.groups[groupId]?.scanCount || 0) + 1
             };
 
+            groupsProcessedCount++;
+
         } catch (error) {
             logger.error({ error }, `  Error processing group ${group.name}`);
         }
@@ -1168,6 +1282,8 @@ async function processGroups(): Promise<void> {
 
     saveUserImageCache(avatarPath, userImageCache);
     logger.info(`User image cache updated with ${Object.keys(userImageCache.images).length} images`);
+
+    return { success: true, groupsProcessed: groupsProcessedCount };
 }
 
 async function collectGroupInfo(group: GroupChat, groupPath: string, mediaPath: string): Promise<GroupInfo> {
@@ -1438,8 +1554,16 @@ async function collectMessages(
     }
 
     const chatMessages: ChatMessage[] = [];
-    let mediaCount = 0;
     const totalMessages = messages.length;
+
+    // Collect media download tasks for concurrent processing
+    interface MediaDownloadTask {
+        chatMessageIndex: number;
+        msg: Message;
+        isViewOnce: boolean;
+        isGif: boolean;
+    }
+    const mediaDownloadTasks: MediaDownloadTask[] = [];
 
     for (let msgIndex = 0; msgIndex < messages.length; msgIndex++) {
         const msg = messages[msgIndex];
@@ -1495,57 +1619,9 @@ async function collectMessages(
         const isGif = msg.type === 'video' && (rawData.isGif || rawData.gifPlayback || false);
         const isEdited = rawData.latestEditMsgKey != null || (msg as any).latestEditMsgKey != null;
 
-        // Handle media
+        // Media will be downloaded concurrently after all messages are processed
         let mediaFilePath: string | null = null;
         let isFailedToDownload = false;
-        if (msg.hasMedia) {
-            let downloadError: string | null = null;
-            try {
-                const media = await withTimeout(
-                    msg.downloadMedia(),
-                    MEDIA_DOWNLOAD_TIMEOUT,
-                    `Download timed out after ${MEDIA_DOWNLOAD_TIMEOUT}ms`
-                );
-                if (media) {
-                    const ext = getMediaExtension(media.mimetype);
-                    const msgIdSafe = msg.id.id.replace(/[^a-zA-Z0-9]/g, '_');
-                    const fileName = `${msgIdSafe}_${msg.type}.${ext}`;
-                    mediaFilePath = path.join(mediaPath, fileName);
-                    await saveMedia(media, mediaFilePath);
-                    mediaCount++;
-                } else {
-                    downloadError = 'Media download returned null';
-                }
-            } catch (error) {
-                downloadError = String(error);
-            }
-
-            if (downloadError) {
-                isFailedToDownload = true;
-                const isOld = (Date.now() / 1000 - msg.timestamp) > 14 * 24 * 60 * 60; // >14 days
-                logger.warn(`    - Media download failed for ${msg.id.id}: ${downloadError}`);
-                errors.push({
-                    timestamp: getISOTimestamp(),
-                    messageId: msg.id.id,
-                    errorType: 'media_download',
-                    error: downloadError,
-                    explanation: isViewOnce
-                        ? 'View once media - only accessible once, may already be viewed'
-                        : isOld
-                            ? 'Message is older than 14 days - media likely expired on WhatsApp servers'
-                            : isGif
-                                ? 'GIF from external source (Giphy/Tenor) - may not be downloadable'
-                                : 'Media temporarily unavailable - network or timing issue',
-                    context: {
-                        messageType: msg.type,
-                        messageTimestamp: msg.timestamp,
-                        isOldMessage: isOld,
-                        isGif: isGif,
-                        isViewOnce: isViewOnce
-                    }
-                });
-            }
-        }
 
         // Get reactions
         const reactions: Array<{ emoji: string; sender: Sender }> = [];
@@ -1716,13 +1792,96 @@ async function collectMessages(
         };
 
         chatMessages.push(chatMessage);
+
+        // Queue media download task if message has media
+        if (msg.hasMedia) {
+            mediaDownloadTasks.push({
+                chatMessageIndex: chatMessages.length - 1,
+                msg,
+                isViewOnce,
+                isGif
+            });
+        }
     }
 
-    if (mediaCount > 0) {
-        logger.info(`  - Downloaded ${mediaCount} media files`);
+    // Download all media concurrently
+    if (mediaDownloadTasks.length > 0) {
+        logger.info(`  - Downloading ${mediaDownloadTasks.length} media files (concurrency: ${MEDIA_DOWNLOAD_CONCURRENCY})...`);
+        const mediaDownloadStart = Date.now();
+        const mediaLimit = pLimit(MEDIA_DOWNLOAD_CONCURRENCY);
+
+        const mediaResults = await Promise.all(
+            mediaDownloadTasks.map((task, taskIndex) =>
+                mediaLimit(async () => {
+                    const { chatMessageIndex, msg, isViewOnce, isGif } = task;
+                    let downloadedPath: string | null = null;
+                    let downloadError: string | null = null;
+
+                    try {
+                        const media = await withTimeout(
+                            msg.downloadMedia(),
+                            MEDIA_DOWNLOAD_TIMEOUT,
+                            `Download timed out after ${MEDIA_DOWNLOAD_TIMEOUT}ms`
+                        );
+                        if (media) {
+                            const ext = getMediaExtension(media.mimetype);
+                            const msgIdSafe = msg.id.id.replace(/[^a-zA-Z0-9]/g, '_');
+                            const fileName = `${msgIdSafe}_${msg.type}.${ext}`;
+                            downloadedPath = path.join(mediaPath, fileName);
+                            await saveMedia(media, downloadedPath);
+                            logger.debug(`    - Downloaded media ${taskIndex + 1}/${mediaDownloadTasks.length}: ${fileName}`);
+                        } else {
+                            downloadError = 'Media download returned null';
+                        }
+                    } catch (error) {
+                        downloadError = String(error);
+                    }
+
+                    return { chatMessageIndex, downloadedPath, downloadError, isViewOnce, isGif, msg };
+                })
+            )
+        );
+
+        // Update chatMessages with download results and collect errors
+        let mediaCount = 0;
+        for (const result of mediaResults) {
+            const { chatMessageIndex, downloadedPath, downloadError, isViewOnce, isGif, msg } = result;
+
+            if (downloadedPath) {
+                chatMessages[chatMessageIndex].media_path = downloadedPath;
+                mediaCount++;
+            } else if (downloadError) {
+                chatMessages[chatMessageIndex].isFailedToDownload = true;
+                const isOld = (Date.now() / 1000 - msg.timestamp) > 14 * 24 * 60 * 60; // >14 days
+                logger.warn(`    - Media download failed for ${msg.id.id}: ${downloadError}`);
+                errors.push({
+                    timestamp: getISOTimestamp(),
+                    messageId: msg.id.id,
+                    errorType: 'media_download',
+                    error: downloadError,
+                    explanation: isViewOnce
+                        ? 'View once media - only accessible once, may already be viewed'
+                        : isOld
+                            ? 'Message is older than 14 days - media likely expired on WhatsApp servers'
+                            : isGif
+                                ? 'GIF from external source (Giphy/Tenor) - may not be downloadable'
+                                : 'Media temporarily unavailable - network or timing issue',
+                    context: {
+                        messageType: msg.type,
+                        messageTimestamp: msg.timestamp,
+                        isOldMessage: isOld,
+                        isGif: isGif,
+                        isViewOnce: isViewOnce
+                    }
+                });
+            }
+        }
+
+        const mediaDownloadDuration = Date.now() - mediaDownloadStart;
+        logger.info(`  - Downloaded ${mediaCount}/${mediaDownloadTasks.length} media files in ${formatDuration(mediaDownloadDuration)}`);
     }
 
-    return { chatMessages, rawMessages: messages, errors, newestTimestamp };
+    return { chatMessages, rawMessages: messages, errors, newestTimestamp }
 }
 
 // ============================================================================
@@ -1730,6 +1889,9 @@ async function collectMessages(
 // ============================================================================
 
 async function main(): Promise<void> {
+    // Parse avatar name from CLI arguments or environment variable
+    AVATAR_NAME = getAvatarName();
+
     logger.info('Starting WhatsApp client...');
     logger.info(`Avatar: ${AVATAR_NAME}`);
     logger.info(`Data will be saved to: ${DATA_DIR}`);

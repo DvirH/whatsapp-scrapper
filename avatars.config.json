@@ -1,0 +1,12 @@
+{
+    "intervalHours": 6,
+    "maxRetries": 3,
+    "retryDelayMs": 60000,
+    "processTimeoutMs": 1800000,
+    "avatars": [
+        {
+            "name": "S62",
+            "enabled": true
+        }
+    ]
+}
