@@ -3,6 +3,7 @@
     "maxRetries": 3,
     "retryDelayMs": 60000,
     "processTimeoutMs": 1800000,
+    "inactivityTimeoutMs": 600000,
     "avatars": [
         {
             "name": "S62",

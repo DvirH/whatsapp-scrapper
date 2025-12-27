@@ -2,6 +2,7 @@ import { spawn, ChildProcess } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import pino from 'pino';
+import treeKill from 'tree-kill';
 
 // ============================================================================
 // Configuration Interfaces
@@ -17,6 +18,7 @@ interface SchedulerConfig {
     maxRetries: number;
     retryDelayMs: number;
     processTimeoutMs: number;
+    inactivityTimeoutMs: number;
     avatars: AvatarConfig[];
 }
 
@@ -163,6 +165,7 @@ class AvatarScheduler {
             config.maxRetries = config.maxRetries || 3;
             config.retryDelayMs = config.retryDelayMs || 60000;
             config.processTimeoutMs = config.processTimeoutMs || 1800000; // 30 minutes
+            config.inactivityTimeoutMs = config.inactivityTimeoutMs || 600000; // 10 minutes
 
             logger.info({
                 intervalHours: config.intervalHours,
@@ -244,8 +247,11 @@ class AvatarScheduler {
 
             this.currentProcess = child;
             let output = '';
+            let lastActivityTime = Date.now();
+            let killed = false;
 
             child.stdout.on('data', (data) => {
+                lastActivityTime = Date.now();
                 const line = data.toString();
                 output += line;
                 // Forward key log lines
@@ -256,25 +262,35 @@ class AvatarScheduler {
             });
 
             child.stderr.on('data', (data) => {
+                lastActivityTime = Date.now();
                 const line = data.toString();
                 output += line;
                 logger.warn({ avatar: avatarName }, line.trim());
             });
 
-            // Timeout handling
-            const timeout = setTimeout(() => {
-                logger.error({ avatar: avatarName }, `Avatar ${avatarName} timed out after ${formatDuration(this.config.processTimeoutMs)}, killing process`);
-                child.kill('SIGTERM');
-                // Give it a moment to terminate gracefully
-                setTimeout(() => {
-                    if (!child.killed) {
-                        child.kill('SIGKILL');
+            // Activity-based timeout: kill only if no output for inactivityTimeoutMs
+            const activityChecker = setInterval(() => {
+                const inactiveMs = Date.now() - lastActivityTime;
+                if (inactiveMs >= this.config.inactivityTimeoutMs && !killed) {
+                    killed = true;
+                    logger.error({ avatar: avatarName }, `Avatar ${avatarName} stuck - no output for ${formatDuration(inactiveMs)}, killing process`);
+
+                    if (child.pid) {
+                        treeKill(child.pid, 'SIGTERM', (err) => {
+                            if (err) logger.error({ err }, 'Failed to kill process tree');
+                        });
+                        // Force kill after 5 seconds if still running
+                        setTimeout(() => {
+                            if (child.pid && !child.killed) {
+                                treeKill(child.pid, 'SIGKILL');
+                            }
+                        }, 5000);
                     }
-                }, 5000);
-            }, this.config.processTimeoutMs);
+                }
+            }, 60000); // Check every minute
 
             child.on('close', (code) => {
-                clearTimeout(timeout);
+                clearInterval(activityChecker);
                 this.currentProcess = null;
                 resolve({
                     success: code === 0,
@@ -284,7 +300,7 @@ class AvatarScheduler {
             });
 
             child.on('error', (err) => {
-                clearTimeout(timeout);
+                clearInterval(activityChecker);
                 this.currentProcess = null;
                 logger.error({ err, avatar: avatarName }, 'Failed to spawn process');
                 resolve({
