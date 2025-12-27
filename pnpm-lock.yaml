@@ -23,6 +23,9 @@ dependencies:
   qrcode-terminal:
     specifier: ^0.12.0
     version: 0.12.0
+  tree-kill:
+    specifier: ^1.2.2
+    version: 1.2.2
   whatsapp-web.js:
     specifier: github:pedroslopez/whatsapp-web.js#main
     version: github.com/pedroslopez/whatsapp-web.js/143662eae200fe53f20524c07a1413b60134daed(typescript@5.9.3)
@@ -1480,6 +1483,11 @@ packages:
     requiresBuild: true
     dev: false
     optional: true
+
+  /tree-kill@1.2.2:
+    resolution: {integrity: sha512-L0Orpi8qGpRG//Nd+H90vFB+3iHnue1zSSGmNOOCh1GLJ7rUKVwV2HvijphGQS2UmhUZewS9VgvxYIdgr+fG1A==}
+    hasBin: true
+    dev: false
 
   /ts-node@10.9.2(@types/node@25.0.3)(typescript@5.9.3):
     resolution: {integrity: sha512-f0FFpIdcHgn8zcPSbf1dRevwt047YMnaiJM3u2w2RewrB+fob/zePZcrOyQoLMMO7aBIddLcQIEK5dYjkLnGrQ==}
