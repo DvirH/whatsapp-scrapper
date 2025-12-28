@@ -1268,8 +1268,9 @@ async function processGroups(): Promise<{ success: boolean; groupsProcessed: num
 
             groupsProcessedCount++;
 
-            // Save user image cache after each group to prevent data loss on crash/termination
+            // Save caches after each group to prevent data loss on crash/termination
             saveUserImageCache(avatarPath, userImageCache);
+            saveScanMetadata(avatarPath, scanMetadata);
 
         } catch (error) {
             logger.error({ error }, `  Error processing group ${group.name}`);
