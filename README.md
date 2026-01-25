@@ -55,6 +55,26 @@ pnpm scheduler
 pnpm scheduler:prod
 ```
 
+### Scheduler Configuration
+
+Edit `avatars.config.json` to configure:
+
+```json
+{
+    "intervalHours": 6,
+    "maxRetries": 3,
+    "avatars": [
+        { "name": "MyAvatar", "enabled": true }
+    ]
+}
+```
+
+| Setting | Description |
+|---------|-------------|
+| `intervalHours` | Hours between scans (e.g., `24` for daily) |
+| `maxRetries` | Retry attempts on failure |
+| `avatars` | List of accounts to scan |
+
 ## Configuration
 
 Create a `.env` file:
